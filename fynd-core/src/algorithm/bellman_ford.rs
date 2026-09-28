@@ -1773,6 +1773,24 @@ mod tests {
             .map(|t| t.address.clone())
             .collect();
         assert_eq!(reached, expected);
+        let hops_to_c: Vec<(&Address, &Address, &str)> = routes.reached[&token_c.address]
+            .hops
+            .iter()
+            .map(|(sold_node, bought_node, component_id)| {
+                (
+                    &ctx.node_address[sold_node],
+                    &ctx.node_address[bought_node],
+                    component_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hops_to_c,
+            vec![
+                (&token_g.address, &token_b.address, "component_gb"),
+                (&token_b.address, &token_c.address, "component_bc"),
+            ]
+        );
     }
 
     #[tokio::test]
