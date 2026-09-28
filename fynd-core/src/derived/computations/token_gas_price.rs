@@ -1504,11 +1504,15 @@ impl DerivedComputation for TokenGasPriceComputation {
 #[cfg(test)]
 mod tests {
     use num_traits::ToPrimitive;
-    use tycho_simulation::tycho_core::models::token::Token;
+    use tycho_simulation::tycho_core::{
+        models::token::Token, simulation::protocol_sim::ProtocolSim,
+    };
 
     use super::*;
     use crate::{
-        algorithm::test_utils::{component, setup_market_weighted, token, MockProtocolSim},
+        algorithm::test_utils::{
+            component, setup_market_weighted, setup_market_weighted_boxed, token, MockProtocolSim,
+        },
         derived::store::DerivedData,
     };
 
@@ -1593,17 +1597,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parallel_pools_price_via_best_output() {
+    async fn test_price_via_parallel_pools() {
         let eth = token(0, "ETH");
         let usdc = token(1, "USDC");
 
         // Two pools on the same pair. The fee-free pool has the tighter spread, but the
         // 1%-fee pool delivers more output on the buy — a ranking by spread would pick
-        // "tight", a ranking by output must pick "wide":
-        //   buy  (wide):  1e18 ETH * 2500 * 0.99          → 2475e18 USDC (tight: 2000e18)
-        //   sell (tight): 2475e18 USDC / 2000             → 1.2375e18 ETH (wide: 0.9801e18)
-        // Each leg independently takes the pool that outputs more, so
-        //   mid = (2475 + 2475/1.2375) / 2 = (2475 + 2000) / 2 = 2237.5
+        // "tight", a ranking by output must pick "wide". The sell goes back through "wide":
+        //   buy:  1e18 ETH * 2500 * 0.99         → 2475e18 USDC
+        //   sell: 2475e18 USDC / 2500 * 0.99     → 0.9801e18 ETH
+        //   mid = 2475 * (1 + 0.9801) / (2 * 0.9801)
         let prices = prices_for(
             &eth,
             vec![
@@ -1613,7 +1616,7 @@ mod tests {
         )
         .await;
 
-        assert!((ratio(&prices[&usdc.address]) - 2237.5).abs() < 1e-6);
+        assert!((ratio(&prices[&usdc.address]) - 2_500.126_262_626).abs() < 1e-6);
     }
 
     #[tokio::test]
@@ -1776,8 +1779,8 @@ mod tests {
     async fn test_incremental_resolves_only_affected_tokens() {
         use tycho_simulation::tycho_common::simulation::protocol_sim::ProtocolSim;
 
-        // max_hops = 1 keeps the two pools out of each other's candidate sets, so each
-        // token's price depends on exactly its own pool.
+        // Each token's buy route is its own pool, so each token's price depends on exactly that
+        // pool.
         let eth = token(0, "ETH");
         let aaa = token(1, "AAA");
         let bbb = token(2, "BBB");
@@ -2729,10 +2732,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deps_cover_rival_routes() {
-        // USDC prices via the direct pool, but the worse ETH->MID->USDC route is a candidate:
-        // its pools must be in USDC's dependency set, or a state change that makes it the
-        // better route would leave the stored price stale until a full recompute.
+    async fn test_deps_rival_route() {
+        // USDC prices via the direct pool, bought and sold back through it. The worse
+        // ETH->MID->USDC route priced nothing, so its pools are not dependencies.
         let eth = token(0, "ETH");
         let usdc = token(1, "USDC");
         let mid = token(2, "MID");
@@ -2753,9 +2755,123 @@ mod tests {
             .token_prices_deps()
             .expect("deps are stored")[&usdc.address]
             .path_components;
-        for component in ["direct", "eth_mid", "mid_usdc"] {
-            assert!(deps.contains(component), "{component} must invalidate USDC's price");
+        assert_eq!(deps, &FxHashSet::from_iter(["direct".to_string()]));
+    }
+
+    /// A pool that fails the reverse sell check: one whose output cap stops the reverse sell, or
+    /// one whose two spot prices disagree.
+    fn flagged_pool(kind: &str, spot_price: f64) -> Box<dyn ProtocolSim> {
+        match kind {
+            // Pays out at most 0.75 ETH, so the X that one probe buys cannot sell back for 1 ETH.
+            "output_cap" => {
+                Box::new(MockProtocolSim::new(spot_price).with_liquidity(PROBE_AMOUNT / 4 * 3))
+            }
+            "skewed_spot" => {
+                Box::new(MockProtocolSim::new(spot_price).with_reverse_spot_factor(0.5))
+            }
+            _ => unreachable!("no flagged pool kind {kind}"),
         }
+    }
+
+    #[rstest::rstest]
+    #[case::output_cap("output_cap")]
+    #[case::skewed_spot("skewed_spot")]
+    #[tokio::test]
+    async fn test_flagged_pool(#[case] kind: &str) {
+        // One probe of 1 ETH buys 0.5 X through the flagged pool, and 0.4 X through
+        // ETH->MID->X. The pass flags the pool and prices X through ETH->MID->X at 0.4.
+        let eth = token(0, "ETH");
+        let x = token(1, "X");
+        let mid = token(2, "MID");
+        let (market, _) = setup_market_weighted_boxed(vec![
+            ("flagged", &eth, &x, flagged_pool(kind, 0.5)),
+            ("eth_mid", &eth, &mid, Box::new(MockProtocolSim::new(1.0))),
+            ("mid_x", &mid, &x, Box::new(MockProtocolSim::new(2.5))),
+        ]);
+        let store = DerivedData::new_shared();
+
+        let prices = computation_for(&eth.address)
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail")
+            .data;
+
+        assert!((ratio(&prices[&x.address]) - 0.4).abs() < 1e-9);
+        let guard = store.read().await;
+        let deps = &guard
+            .token_prices_deps()
+            .expect("deps are stored")[&x.address]
+            .path_components;
+        assert_eq!(deps, &FxHashSet::from_iter(["eth_mid".to_string(), "mid_x".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_token_only_a_flagged_pool_reaches() {
+        // The skewed pool is the only route to Y and its swaps work, so a sell solve through it
+        // prices Y at 0.5 on both pricing passes. The second pricing pass's first buy pass leaves
+        // the pool out, so it must run the buy pass through every pool to reach Y.
+        let eth = token(0, "ETH");
+        let y = token(1, "Y");
+        let (market, _) = setup_market_weighted_boxed(vec![(
+            "skewed",
+            &eth,
+            &y,
+            flagged_pool("skewed_spot", 0.5),
+        )]);
+        let store = DerivedData::new_shared();
+        let computation = computation_for(&eth.address);
+        let skewed_changed =
+            ChangedComponents { updated: vec!["skewed".to_string()], ..Default::default() };
+
+        let first = computation
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail")
+            .data;
+        let second = computation
+            .compute(&market, &store, &skewed_changed)
+            .await
+            .expect("pricing must not fail")
+            .data;
+
+        assert!((ratio(&first[&y.address]) - 0.5).abs() < 1e-9);
+        assert!((ratio(&second[&y.address]) - 0.5).abs() < 1e-9);
+        let guard = store.read().await;
+        let deps = &guard
+            .token_prices_deps()
+            .expect("deps are stored")[&y.address]
+            .path_components;
+        assert_eq!(deps, &FxHashSet::from_iter(["skewed".to_string()]));
+    }
+
+    #[test]
+    fn test_flag_expiry() {
+        let computation = computation_for(&token(0, "ETH").address);
+        let record_pass = |new_flagged_components: FxHashSet<ComponentId>| {
+            let outcome = PricingPassOutcome {
+                prices: FxHashMap::default(),
+                block: 0,
+                failed_items: Vec::new(),
+                unattempted: FxHashSet::default(),
+                new_flagged_components,
+            };
+            computation.record_pass(&FxHashSet::default(), &outcome, &FxHashSet::default());
+        };
+        let flagged = FxHashSet::from_iter(["pool".to_string()]);
+        record_pass(flagged.clone());
+        let run_passes = |count: u64| {
+            for _ in 0..count {
+                record_pass(FxHashSet::default());
+            }
+        };
+
+        run_passes(FLAGGED_POOL_PASSES - 1);
+        let before_expiry = computation.read_flagged_components();
+        run_passes(1);
+        let after_expiry = computation.read_flagged_components();
+
+        assert_eq!(before_expiry, flagged);
+        assert!(after_expiry.is_empty());
     }
 
     #[tokio::test]

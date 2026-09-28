@@ -1920,8 +1920,10 @@ mod tests {
             3,
             &RouteExclusions::default(),
         );
-        ctx.reroot_toward(graph, node_of(&token_c.address), gas_node, &hops_to_gas, 3)
-            .expect("a C-to-G path exists");
+        assert!(
+            ctx.reroot_toward(graph, node_of(&token_c.address), gas_node, &hops_to_gas, 3),
+            "a C-to-G path exists"
+        );
         let ord = order(&token_c, &token_g, 100, OrderSide::Sell);
         let result = algo
             .find_single_route(&ctx, &ord, FindRouteOptions::default())
