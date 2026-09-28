@@ -681,6 +681,34 @@ mod tests {
     }
 
     #[test]
+    fn test_drop_failures_of_removed() {
+        let failure = |component: &str| {
+            let key = format!("{component}/{}/{}", addr(0x01), addr(0x02));
+            failed(&key, FailedItemError::MissingSimulationState)
+        };
+        let mut store = DerivedData::new();
+        store.set_spot_prices(Default::default(), vec![failure("gone"), failure("kept")], 1, true);
+        store.set_component_depths(
+            Default::default(),
+            vec![failure("gone"), failure("kept")],
+            1,
+            true,
+        );
+
+        store.drop_failures_of_removed(&["gone".to_string()]);
+
+        let key = |component: &str| pair_key(component, 0x01, 0x02);
+        assert_eq!(store.spot_price_failure(&key("gone")), None);
+        assert_eq!(store.component_depth_failure(&key("gone")), None);
+        assert!(store
+            .spot_price_failure(&key("kept"))
+            .is_some());
+        assert!(store
+            .component_depth_failure(&key("kept"))
+            .is_some());
+    }
+
+    #[test]
     fn test_rerunning_with_empty_failures_clears_old_reasons() {
         let key = pair_key("component1", 0x01, 0x02);
         let key_str = format!("component1/{}/{}", addr(0x01), addr(0x02));
