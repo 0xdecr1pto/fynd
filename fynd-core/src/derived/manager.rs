@@ -121,9 +121,9 @@ pub struct ComputationManagerConfig {
     gas_token: Address,
     /// Max hop count for token gas price computation.
     max_hop: usize,
-    /// Slippage threshold for component depth computation (0.0 < threshold < 1.0).
-    depth_slippage_threshold: f64,
-    /// Overrides the token pricing pass's sell-loop budget; `None` keeps the computation's
+    /// The share by which a pool's net marginal price falls at its depth (0.0 < drop < 1.0).
+    depth_marginal_price_drop: f64,
+    /// Overrides the token pricing pass budget; `None` keeps the computation's
     /// default. The replay harness sets an effectively unbounded budget so integration tests
     /// can assert exact priced-token counts.
     pricing_pass_budget: Option<Duration>,
@@ -153,7 +153,7 @@ impl ComputationManagerConfig {
         self
     }
 
-    /// Overrides the wall-clock budget for the token pricing pass's sell loop.
+    /// Overrides the wall-clock budget for a token pricing pass after its first buy pass.
     pub fn with_pricing_pass_budget(mut self, pass_budget: Duration) -> Self {
         self.pricing_pass_budget = Some(pass_budget);
         self

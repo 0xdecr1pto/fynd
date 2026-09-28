@@ -10,40 +10,55 @@
 //! quotes.
 //!
 //! Each pass simulates buying selected tokens with `probe_amount` of the gas token, then selling
-//! the bought amounts back. Both simulations include swap fees and slippage: the effect of trade
-//! size on the exchange rate. Gas-aware scoring needs the prices being calculated, so pricing
-//! disables gas-aware scoring. Pricing needs no output from another derived computation.
+//! each bought amount back along its buy route, reversed. Both simulations include swap fees and
+//! slippage: the effect of trade size on the exchange rate. Gas-aware scoring needs the prices
+//! being calculated, so pricing disables gas-aware scoring. Pricing needs no output from another
+//! derived computation.
 //!
-//! `price_token` stores the arithmetic mean of two rates as an exact fraction. Both rates express
-//! token units per gas token unit. The buy rate divides the bought amount by `probe_amount`; the
-//! sell rate divides the bought amount by the gas token amount returned. The mean understates the
-//! token's value in gas, with greater bias for larger round-trip losses. The geometric mean would
-//! be exact for equal losses in both directions, but an exact fraction cannot always represent it.
+//! `build_price_entry` stores the arithmetic mean of two rates as an exact fraction. Both rates
+//! express token units per gas token unit. The buy rate divides the bought amount by
+//! `probe_amount`; the sell rate divides the bought amount by the gas token amount returned. The
+//! mean understates the token's value in gas, with greater bias for larger round-trip losses. The
+//! geometric mean would be exact for equal losses in both directions, but an exact fraction cannot
+//! always represent it.
 //!
 //! A token dependency is a component whose changes can require a new price. `path_components`
-//! includes possible sell routes and chosen buy and sell routes, so alternative routes can trigger
-//! updates. `update_prices` removes the price and dependencies when an attempted token has no
-//! price.
+//! holds the components of the routes that priced the token. A change to a rival pool does not
+//! select the token: the token gets a better route only when a change to a pool on its current
+//! route selects it. `update_prices` removes the price and dependencies when an attempted token
+//! has no price.
+//!
+//! # Flagged pools
+//!
+//! A flagged pool is a pool whose two directions disagree: its spot price fails, its reverse swap
+//! fails or returns zero, or `spot(a→b) * spot(b→a)` is outside `VALID_SPOT_PRODUCT_RANGE`. Such
+//! a pool can sell a token at a price it does not buy it back at, and the reversed buy route
+//! would then price the token through it. The sell back flags the first such pool it reaches. A second buy
+//! pass buys every token whose sell back reached a flagged pool again, without the flagged pools,
+//! and the pass sells each back along its new route. A token that still fails gets a sell solve,
+//! as does a token that only a flagged pool reaches. The pass history keeps each flag for
+//! `FLAGGED_POOL_PASSES` passes, and the first buy pass of those passes leaves the pool out.
 //!
 //! # Cost
 //!
-//! Each pass uses one market snapshot and one buy search for all selected tokens. Each token needs
-//! a separate sell search because slippage makes route choice depend on the bought amount. Sell
-//! searches account for most of the work.
+//! Each pass uses one market snapshot and one buy pass for all selected tokens. Each token's sell
+//! swaps once per hop of its buy route. Flagged pools add at most two buy passes per pass, and a
+//! sell solve for each token they leave without a price. A sell solve is the expensive step: it
+//! re-roots the snapshot and simulates every pool within `max_hops` of the token.
 //!
 //! Token prices and spot prices run in the same stage: a group of derived computations that run
 //! together. The manager waits for the stage before storing outputs. Slow pricing therefore delays
 //! spot price storage, component depth computation, and processing of the next market event.
 //!
-//! `pass_budget` starts after snapshot creation and the buy search. The sell loop checks the
-//! deadline before each token but does not interrupt a sell search already in progress.
+//! `pass_budget` starts after snapshot creation and the first buy pass. The pass checks the
+//! deadline before each reverse sell, before the second buy pass and before each sell solve, but
+//! does not interrupt a step already in progress. The sell solves run last, in the order the
+//! tokens were selected.
 //!
 //! # Why the pass is capped, spaced and rotated
 //!
-//! Many sell routes share components near the gas token. Dependencies also include alternative
-//! routes. Selecting tokens from changed dependencies alone therefore does not reliably limit
-//! work. Measured on Base at `min-tvl 1` on 2026-09-23: 46 consecutive selections took 2126 to
-//! 2134 tokens of 2130, and pricing ran at a 97.8% duty cycle.
+//! Many routes share components near the gas token, so selecting tokens from changed
+//! dependencies alone does not reliably limit work.
 //!
 //! `max_tokens_per_pass` caps every pass by count. `solve_token_prices` selects tokens before
 //! building the snapshot around routes toward those tokens. A time limit cannot select that set.
@@ -105,6 +120,7 @@
 //! cap, but the sell deadline, failures, and timeouts can still leave tokens without prices.
 
 use std::{
+    ops::RangeInclusive,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -116,12 +132,14 @@ use petgraph::graph::NodeIndex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, instrument, trace, warn, Span};
 use tycho_simulation::{
-    tycho_common::models::Address, tycho_core::simulation::protocol_sim::Price,
+    tycho_common::models::{token::Token, Address},
+    tycho_core::simulation::protocol_sim::{Price, ProtocolSim},
 };
 
 use crate::{
     algorithm::{
         bellman_ford::{BellmanFordContext, FindRouteOptions, ReachOutcome, ReachedToken},
+        sim_guard::GuardedProtocolSim,
         Algorithm, AlgorithmConfig, BellmanFordAlgorithm,
     },
     derived::{
@@ -139,54 +157,130 @@ use crate::{
     types::{ComponentId, Order, OrderSide, RouteExclusions},
 };
 
-/// One pricing pass's solving state: a single market snapshot re-rooted for every sell.
+/// The range of `spot(a→b) * spot(b→a)` for a pool whose two spot prices agree. A pool with no
+/// fee gives 1, and a fee moves the product away from 1 by about twice the fee. Token pricing
+/// flags a pool outside the range. The check cannot remove the fee itself, because
+/// `ProtocolSim::fee` panics for several protocols.
+const VALID_SPOT_PRODUCT_RANGE: RangeInclusive<f64> = 0.9..=1.5;
+
+/// A graph's edges: token node → (the node it swaps into, the pool that swaps it).
+type Adjacency = FxHashMap<NodeIndex, Vec<(NodeIndex, ComponentId)>>;
+
+/// The state of one pricing pass: a single market snapshot, and the buy passes run on it.
 ///
-/// The context is built once around the gas token, and every solve — the buy pass and each
-/// token's sell — runs against it. One snapshot replaces a per-token lock and state clone,
-/// and it makes the pass consistent: both legs of every price read the same block's states.
-///
-/// Each sell still walks its own subgraph, pruned toward the gas token — relaxation simulates
-/// every edge it relaxes, and unpruned that is most of the market per token — but the pruning
-/// map (`hops_to_gas`) is a single BFS shared by all of them.
-struct PricingPass<'a> {
-    /// The solving algorithm; its `max_hops` bounds route length and each sell's pruned walk.
+/// The snapshot is built once around the gas token, and every buy pass and sell solve in the
+/// pricing pass reads it.
+struct PricingPassState<'a> {
+    /// The Bellman-Ford algorithm. Its `max_hops` limits every buy route, and the subgraph each
+    /// sell solve re-roots to.
     algorithm: &'a BellmanFordAlgorithm,
     graph: &'a <BellmanFordAlgorithm as Algorithm>::GraphType,
-    /// The shared snapshot, re-rooted and re-pruned per sell.
+    /// The shared snapshot. Each buy pass and each sell solve sets its adjacency and endpoints.
     ctx: BellmanFordContext,
     /// The computation whose parameters — gas token, probe amount, budget — the pass solves with.
     computation: &'a TokenGasPriceComputation,
-    /// The buy pass's result, solved at construction: every token one probe of gas token
-    /// reaches, with what the best route delivers there.
-    buys: ReachOutcome,
-    /// The gas token's node, saved before the first reroot moves `ctx` off it.
+    /// The snapshot's adjacency with every pool in it. Each buy pass starts from a copy.
+    full_adjacency: Adjacency,
+    /// The components that earlier pricing passes flagged and that are in this pass's subgraph.
+    /// The first buy pass leaves them out.
+    earlier_flagged_components: FxHashSet<ComponentId>,
+    /// The components that this pricing pass flagged.
+    new_flagged_components: FxHashSet<ComponentId>,
+    /// The spot price check of each hop a reverse sell ran: `None` when the pool passed, else
+    /// why it failed. The check does not depend on the amount, so each hop runs it once.
+    spot_checks: FxHashMap<(ComponentId, NodeIndex, NodeIndex), Option<PoolFlagReason>>,
+    /// The buy pass through every pool, flagged ones included. The pricing pass runs it the first
+    /// time the buy pass without earlier flagged components misses a token, and reuses it after.
+    buys_through_all_pools: Option<ReachOutcome>,
+    /// The gas token's node, which every buy pass starts from.
     gas_node: NodeIndex,
-    /// Hops from each node to the gas token, computed once, pruning every sell's walk.
+    /// The hop count from each node to the gas token. Every sell solve prunes its subgraph with
+    /// it.
     hops_to_gas: FxHashMap<NodeIndex, usize>,
     /// Token address → graph node, inverted once from the context, for re-rooting sells.
     token_nodes: FxHashMap<Address, NodeIndex>,
 }
 
-/// One sell leg's result: what the route delivers and what the price depends on.
-struct SellLeg {
-    /// What selling back to the gas token returns; never zero.
-    amount_out: BigUint,
-    /// Every component on any candidate route between the token and the gas token, plus the
-    /// chosen route's own, defensively.
-    components: FxHashSet<ComponentId>,
+/// The pricing result for one token in a pricing pass.
+enum TokenPricingOutcome {
+    /// The token's price and the components used to compute it.
+    Priced(TokenPriceEntry),
+    /// The error from a sell solve that produces no price.
+    Failed(FailedItemError),
+    /// Pricing is incomplete; the token keeps its previous price, dependencies, and stamp.
+    Unattempted,
+    /// No buy pass that finished reached the token.
+    Unreachable,
 }
 
-impl<'a> PricingPass<'a> {
-    /// Builds the pass and runs its buy pass. Construction owns the buy pass because it is only
-    /// valid before the first reroot replaces the context's subgraph — a pass in hand always
-    /// carries its buys.
+/// The tokens a reverse sell could not price, each with the buy route a later step uses.
+#[derive(Default)]
+struct QueuedTokens {
+    /// Tokens whose reverse sell reached a flagged pool, with the buy route that reached it.
+    on_flagged_routes: FxHashMap<Address, ReachedToken>,
+    /// Tokens to price with a sell solve, with the buy route whose amount the sell solve sells.
+    for_sell_solve: FxHashMap<Address, ReachedToken>,
+}
+
+/// The result of a reverse sell along a token's buy route.
+enum ReverseSellOutcome {
+    /// The nonzero gas token amount returned by the reverse sell.
+    Sold(BigUint),
+    /// The first pool that fails a reverse sell check and the reason to flag it.
+    FlaggedPool(ComponentId, PoolFlagReason),
+    /// A hop lacks simulation state or token metadata; this does not flag the pool.
+    MissingHopData,
+}
+
+/// The reason a reverse sell flags a pool.
+#[derive(Debug, Clone, Copy)]
+enum PoolFlagReason {
+    /// A spot price lookup fails in at least one direction.
+    SpotPriceFailed,
+    /// The product of the two directional spot prices falls outside `VALID_SPOT_PRODUCT_RANGE`.
+    SpotProductOutOfRange,
+    /// The reverse swap simulation fails.
+    SwapFailed,
+    /// The reverse swap simulation returns zero.
+    ZeroOutput,
+}
+
+/// Returns why the pool's two spot prices between `token_in` and `token_out` fail the check, or
+/// `None` when they agree.
+fn check_spot_prices(
+    sim: &dyn ProtocolSim,
+    token_in: &Token,
+    token_out: &Token,
+) -> Option<PoolFlagReason> {
+    let (Ok(forward_spot), Ok(reverse_spot)) =
+        (sim.spot_price(token_out, token_in), sim.spot_price(token_in, token_out))
+    else {
+        return Some(PoolFlagReason::SpotPriceFailed);
+    };
+    if !VALID_SPOT_PRODUCT_RANGE.contains(&(forward_spot * reverse_spot)) {
+        return Some(PoolFlagReason::SpotProductOutOfRange);
+    }
+    None
+}
+
+impl<'a> PricingPassState<'a> {
     fn new(
         algorithm: &'a BellmanFordAlgorithm,
         graph: &'a <BellmanFordAlgorithm as Algorithm>::GraphType,
-        ctx: BellmanFordContext,
+        mut ctx: BellmanFordContext,
         computation: &'a TokenGasPriceComputation,
+        earlier_flagged_components: FxHashSet<ComponentId>,
     ) -> Self {
-        let buys = algorithm.reach_from_source_token(&ctx, &computation.probe_amount);
+        let full_adjacency = std::mem::take(&mut ctx.adj);
+        let subgraph_components: FxHashSet<&ComponentId> = full_adjacency
+            .values()
+            .flatten()
+            .map(|(_, component_id)| component_id)
+            .collect();
+        let earlier_flagged_components = earlier_flagged_components
+            .into_iter()
+            .filter(|component_id| subgraph_components.contains(component_id))
+            .collect();
         let gas_node = ctx.token_in_node;
         let token_nodes = ctx
             .node_address
@@ -202,52 +296,258 @@ impl<'a> PricingPass<'a> {
             algorithm.max_hops(),
             &RouteExclusions::default(),
         );
-        Self { algorithm, graph, ctx, computation, buys, gas_node, hops_to_gas, token_nodes }
+        Self {
+            algorithm,
+            graph,
+            ctx,
+            computation,
+            full_adjacency,
+            earlier_flagged_components,
+            new_flagged_components: FxHashSet::default(),
+            spot_checks: FxHashMap::default(),
+            buys_through_all_pools: None,
+            gas_node,
+            hops_to_gas,
+            token_nodes,
+        }
     }
 
-    /// Prices every token the budget allows, one sell relaxation each — the pass's dominant
-    /// cost. Pure CPU work: callers run it on a blocking thread.
-    /// The order of `tokens_to_price` decides what a cut-short pass prices: the loop attempts
-    /// the tokens in the order given and stops at the deadline, so the caller puts the tokens
-    /// that must not be dropped at the front.
-    fn sell_loop(&mut self, tokens_to_price: Vec<Address>, block: u64) -> PricingPassOutcome {
+    /// Prices every token the budget allows. Pure CPU work: callers run it on a blocking thread.
+    ///
+    /// The pricing pass runs a buy pass without the earlier flagged components, then works in
+    /// three steps: a reverse sell for each token, a buy pass without any flagged component for
+    /// the tokens whose reverse sell reached a flagged pool, then a sell solve for each token still
+    /// without a price. Sell solves are the expensive step, so they run last, in the order of
+    /// `tokens_to_price`. The deadline is checked before each reverse sell of the first step,
+    /// before the second step, and before each sell solve. So a pricing pass that the deadline
+    /// cuts short prices the front of that order, and the caller puts the tokens that must not be
+    /// dropped there. A token that no step prices is unattempted.
+    fn price_tokens(&mut self, tokens_to_price: Vec<Address>, block: u64) -> PricingPassOutcome {
+        let adjacency = self.build_adjacency_without(&self.earlier_flagged_components);
+        let mut buys = self.run_buy_pass(adjacency);
         let deadline = Instant::now() + self.computation.pass_budget;
+        let mut outcomes = FxHashMap::default();
+        let mut queued = QueuedTokens::default();
+        for token in &tokens_to_price {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Some(outcome) = self.price_with_reverse_sell(token, &mut buys, &mut queued) {
+                outcomes.insert(token.clone(), outcome);
+            }
+        }
+        let QueuedTokens { on_flagged_routes, mut for_sell_solve } = queued;
+        if Instant::now() < deadline {
+            self.price_without_flagged_pools(on_flagged_routes, &mut outcomes, &mut for_sell_solve);
+        }
+        for token in &tokens_to_price {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Some(buy_leg) = for_sell_solve.remove(token) {
+                outcomes.insert(token.clone(), self.price_with_sell_solve(token, &buy_leg));
+            }
+        }
+        let token_outcomes = tokens_to_price
+            .into_iter()
+            .map(|token| {
+                let outcome = outcomes
+                    .remove(&token)
+                    .unwrap_or(TokenPricingOutcome::Unattempted);
+                (token, outcome)
+            })
+            .collect();
+        self.build_outcome(token_outcomes, buys.timed_out, block)
+    }
+
+    /// Prices `token` with a reverse sell along its route in `buys`. Returns `None` when it queues
+    /// the token in `queued`: when the reverse sell reaches a flagged pool or misses hop data, and
+    /// when only a flagged pool reaches the token.
+    fn price_with_reverse_sell(
+        &mut self,
+        token: &Address,
+        buys: &mut ReachOutcome,
+        queued: &mut QueuedTokens,
+    ) -> Option<TokenPricingOutcome> {
+        let Some(buy_leg) = buys.reached.remove(token) else {
+            // A buy pass that timed out says nothing about reachability, so the token keeps its
+            // price and dependencies.
+            if buys.timed_out {
+                return Some(TokenPricingOutcome::Unattempted);
+            }
+            return self.queue_sell_solve_through_flagged_pools(token, queued);
+        };
+        match self.reverse_sell(&buy_leg) {
+            ReverseSellOutcome::Sold(sell_out) => {
+                Some(TokenPricingOutcome::Priced(self.build_price_entry(token, &buy_leg, sell_out)))
+            }
+            ReverseSellOutcome::FlaggedPool(component_id, reason) => {
+                self.flag(component_id, reason);
+                queued
+                    .on_flagged_routes
+                    .insert(token.clone(), buy_leg);
+                None
+            }
+            ReverseSellOutcome::MissingHopData => {
+                queued
+                    .for_sell_solve
+                    .insert(token.clone(), buy_leg);
+                None
+            }
+        }
+    }
+
+    /// Looks for a route to `token` in the buy pass through every pool, for a token that the buy
+    /// pass without the earlier flagged components did not reach. A flagged component can be the
+    /// only way to reach a token. Such a token is queued in `queued` for a sell solve on that
+    /// route, because a reverse sell through a flagged pool gives no trusted price, and the
+    /// function returns `None`.
+    ///
+    /// Many tokens are unreachable, so the pricing pass counts them instead of allocating,
+    /// logging and sending a failed item per token on every block.
+    fn queue_sell_solve_through_flagged_pools(
+        &mut self,
+        token: &Address,
+        queued: &mut QueuedTokens,
+    ) -> Option<TokenPricingOutcome> {
+        // With no earlier flagged component in the subgraph, the buy pass already went through
+        // every pool. A token outside the subgraph has no route in any buy pass.
+        if self
+            .earlier_flagged_components
+            .is_empty() ||
+            !self.token_nodes.contains_key(token)
+        {
+            return Some(TokenPricingOutcome::Unreachable);
+        }
+        let mut buys = match self.buys_through_all_pools.take() {
+            Some(buys) => buys,
+            None => self.run_buy_pass(self.full_adjacency.clone()),
+        };
+        let outcome = match buys.reached.remove(token) {
+            Some(buy_leg) => {
+                queued
+                    .for_sell_solve
+                    .insert(token.clone(), buy_leg);
+                None
+            }
+            None if buys.timed_out => Some(TokenPricingOutcome::Unattempted),
+            None => Some(TokenPricingOutcome::Unreachable),
+        };
+        self.buys_through_all_pools = Some(buys);
+        outcome
+    }
+
+    /// Returns the snapshot's adjacency without the edges of the `excluded` components.
+    fn build_adjacency_without(&self, excluded: &FxHashSet<ComponentId>) -> Adjacency {
+        let mut adjacency = self.full_adjacency.clone();
+        if excluded.is_empty() {
+            return adjacency;
+        }
+        for edges in adjacency.values_mut() {
+            edges.retain(|(_, component_id)| !excluded.contains(component_id));
+        }
+        adjacency
+    }
+
+    /// Runs a buy pass from the gas token over `adjacency`.
+    fn run_buy_pass(&mut self, adjacency: Adjacency) -> ReachOutcome {
+        self.ctx.adj = adjacency;
+        self.ctx.token_in_node = self.gas_node;
+        self.ctx.token_out_node = None;
+        self.algorithm
+            .reach_from_source_token(&self.ctx, &self.computation.probe_amount)
+    }
+
+    /// Flags `component_id` for the rest of this pricing pass and for the pricing passes after it.
+    fn flag(&mut self, component_id: ComponentId, reason: PoolFlagReason) {
+        if !self
+            .new_flagged_components
+            .contains(&component_id)
+        {
+            debug!(component_id, ?reason, "token pricing flagged a pool");
+            self.new_flagged_components
+                .insert(component_id);
+        }
+    }
+
+    /// Runs a buy pass without any flagged component, and prices each token in
+    /// `on_flagged_routes` with a reverse sell along its route in that buy pass. The price goes to
+    /// `outcomes`. A token that this buy pass does not reach, or whose route reaches a flagged pool
+    /// too, goes to `for_sell_solve` with its route in `on_flagged_routes`. A token whose route
+    /// misses hop data goes there with its route in this buy pass. When this buy pass times out,
+    /// a token it did not reach stays unattempted.
+    fn price_without_flagged_pools(
+        &mut self,
+        on_flagged_routes: FxHashMap<Address, ReachedToken>,
+        outcomes: &mut FxHashMap<Address, TokenPricingOutcome>,
+        for_sell_solve: &mut FxHashMap<Address, ReachedToken>,
+    ) {
+        if on_flagged_routes.is_empty() {
+            return;
+        }
+        let excluded = self
+            .earlier_flagged_components
+            .union(&self.new_flagged_components)
+            .cloned()
+            .collect();
+        let adjacency = self.build_adjacency_without(&excluded);
+        let mut buys = self.run_buy_pass(adjacency);
+
+        for (token, flagged_route) in on_flagged_routes {
+            let Some(buy_leg) = buys.reached.remove(&token) else {
+                if !buys.timed_out {
+                    for_sell_solve.insert(token, flagged_route);
+                }
+                continue;
+            };
+            match self.reverse_sell(&buy_leg) {
+                ReverseSellOutcome::Sold(sell_out) => {
+                    let entry = self.build_price_entry(&token, &buy_leg, sell_out);
+                    outcomes.insert(token, TokenPricingOutcome::Priced(entry));
+                }
+                ReverseSellOutcome::FlaggedPool(component_id, reason) => {
+                    self.flag(component_id, reason);
+                    for_sell_solve.insert(token, flagged_route);
+                }
+                ReverseSellOutcome::MissingHopData => {
+                    for_sell_solve.insert(token, buy_leg);
+                }
+            }
+        }
+    }
+
+    /// Sorts the token outcomes into the pricing pass's outcome, and logs how the pricing pass
+    /// went.
+    fn build_outcome(
+        &mut self,
+        outcomes: Vec<(Address, TokenPricingOutcome)>,
+        buy_pass_timed_out: bool,
+        block: u64,
+    ) -> PricingPassOutcome {
         let mut prices = FxHashMap::default();
         let mut failed_items = Vec::new();
         let mut unattempted = FxHashSet::default();
         let mut unreachable_tokens = 0usize;
-        let mut remaining = tokens_to_price.into_iter();
-        for token in &mut remaining {
-            if Instant::now() >= deadline {
-                unattempted.insert(token);
-                break;
-            }
-            // A token the buy pass never reached is counted, not failed: unreachable is the
-            // normal state of much of the topology, and a failed item each would be allocated,
-            // logged, and broadcast to every worker every block. But a cut-short buy pass says
-            // nothing about reachability, so its missing tokens are carried exactly like a
-            // deadline cut-off — price and dependencies intact.
-            let Some(buy_leg) = self.buys.reached.remove(&token) else {
-                if self.buys.timed_out {
+        for (token, outcome) in outcomes {
+            match outcome {
+                TokenPricingOutcome::Priced(entry) => {
+                    prices.insert(token, entry);
+                }
+                TokenPricingOutcome::Failed(error) => {
+                    failed_items.push(FailedItem { key: token.to_string(), error });
+                }
+                TokenPricingOutcome::Unattempted => {
                     unattempted.insert(token);
-                } else {
-                    unreachable_tokens += 1;
                 }
-                continue;
-            };
-            match self.price_token(&token, &buy_leg) {
-                Ok(priced) => {
-                    prices.insert(token, priced);
-                }
-                Err(error) => failed_items.push(FailedItem { key: token.to_string(), error }),
+                TokenPricingOutcome::Unreachable => unreachable_tokens += 1,
             }
         }
-        unattempted.extend(remaining);
         if unattempted.is_empty() {
             debug!(
                 priced = prices.len(),
                 failed = failed_items.len(),
                 unreachable = unreachable_tokens,
+                new_flagged_components = self.new_flagged_components.len(),
                 block,
                 "token pricing pass complete"
             );
@@ -257,82 +557,117 @@ impl<'a> PricingPass<'a> {
                 failed = failed_items.len(),
                 unreachable = unreachable_tokens,
                 unattempted = unattempted.len(),
-                buy_pass_timed_out = self.buys.timed_out,
+                buy_pass_timed_out,
                 block,
                 "token pricing pass cut short; unattempted tokens keep previous prices"
             );
         }
-
-        PricingPassOutcome { prices, block, failed_items, unattempted }
+        let new_flagged_components = std::mem::take(&mut self.new_flagged_components);
+        PricingPassOutcome { prices, block, failed_items, unattempted, new_flagged_components }
     }
 
     /// Prices one token as the arithmetic mean of its buy price and its sell price, kept as an
-    /// exact fraction, with the components that must re-price it when they change. The mean's
-    /// round-trip bias only ever prices a token low, hardest on thin pairs — see the module doc.
-    ///
-    /// The component set covers every candidate route between the token and the gas token, not
-    /// just the two chosen ones: a rival pool can move and become the better route, and only a
-    /// full recompute would ever notice if it were not in the set.
-    ///
-    /// A token that cannot be sold back is an error, not a price: a buy rate alone would flatter
-    /// a token that is expensive to exit, and prices must stay comparable across tokens.
-    fn price_token(
-        &mut self,
+    /// exact fraction, and stores the buy route's components as its dependencies. The mean prices a
+    /// token low, most on thin pairs; the module doc says why.
+    fn build_price_entry(
+        &self,
         token: &Address,
         buy_leg: &ReachedToken,
-    ) -> Result<TokenPriceEntry, FailedItemError> {
-        let SellLeg { amount_out: sell_out, mut components } =
-            self.solve_sell_leg(token, buy_leg.amount_out.clone())?;
+        sell_out: BigUint,
+    ) -> TokenPriceEntry {
         // The legs are discarded after the mean; this is the only place their divergence —
         // sell_out under the probe amount is the round-trip loss — can be observed.
         trace!(%token, buy_out = %buy_leg.amount_out, sell_out = %sell_out, "token priced");
-        // The buy path is a candidate path, so extending is defensive: it keeps the stored
-        // dependencies correct even if the walk and the relaxation ever disagree.
-        components.extend(
-            buy_leg
-                .hops
-                .iter()
-                .map(|(_, _, component_id)| component_id.clone()),
-        );
-
+        let path_components = buy_leg
+            .hops
+            .iter()
+            .map(|(_, _, component_id)| component_id.clone())
+            .collect();
         let mid_price = Price {
             numerator: &buy_leg.amount_out * (&self.computation.probe_amount + &sell_out),
             denominator: BigUint::from(2u8) * &self.computation.probe_amount * sell_out,
         };
-        Ok(TokenPriceEntry { price: mid_price, path_components: components })
+        TokenPriceEntry { price: mid_price, path_components }
     }
 
-    /// Solves the route selling `amount` of `token` back to the gas token, re-rooting the
-    /// pass's shared context at `token` first. Fails as `MissingSellRoute` carrying why: on a
-    /// block where many tokens fail at once, the distribution of reasons is the signal.
+    /// Prices a token with a sell solve of its bought amount back to the gas token. The stored
+    /// components are the pools of the buy route and of the sell route. A token the sell solve
+    /// cannot sell back gets an error, not a price; the module doc says why.
+    fn price_with_sell_solve(
+        &mut self,
+        token: &Address,
+        buy_leg: &ReachedToken,
+    ) -> TokenPricingOutcome {
+        match self.solve_sell_leg(token, buy_leg.amount_out.clone()) {
+            Ok((sell_out, sell_components)) => {
+                let mut entry = self.build_price_entry(token, buy_leg, sell_out);
+                entry
+                    .path_components
+                    .extend(sell_components);
+                TokenPricingOutcome::Priced(entry)
+            }
+            Err(error) => TokenPricingOutcome::Failed(error),
+        }
+    }
+
+    /// Sells the bought amount back along the buy route, hop by hop in reverse. Returns
+    /// `FlaggedPool` with the first pool whose spot price fails, whose spot product is outside
+    /// `VALID_SPOT_PRODUCT_RANGE`, or whose swap fails or returns zero.
+    fn reverse_sell(&mut self, buy_leg: &ReachedToken) -> ReverseSellOutcome {
+        let mut amount = buy_leg.amount_out.clone();
+        for (sold_node, bought_node, component_id) in buy_leg.hops.iter().rev() {
+            let flagged = |reason| ReverseSellOutcome::FlaggedPool(component_id.clone(), reason);
+            let (Some(sim), Some(token_in), Some(token_out)) = (
+                self.ctx
+                    .market_data
+                    .get_simulation_state(component_id),
+                self.ctx.token_map.get(bought_node),
+                self.ctx.token_map.get(sold_node),
+            ) else {
+                return ReverseSellOutcome::MissingHopData;
+            };
+            let spot_check = self
+                .spot_checks
+                .entry((component_id.clone(), *sold_node, *bought_node))
+                .or_insert_with(|| check_spot_prices(sim, token_in, token_out));
+            if let Some(reason) = *spot_check {
+                return flagged(reason);
+            }
+            match sim.get_amount_out_guarded(amount, token_in, token_out) {
+                Ok(result) if !result.amount.is_zero() => amount = result.amount,
+                Ok(_) => return flagged(PoolFlagReason::ZeroOutput),
+                Err(_) => return flagged(PoolFlagReason::SwapFailed),
+            }
+        }
+        ReverseSellOutcome::Sold(amount)
+    }
+
+    /// Re-roots the pass's shared snapshot at `token`, solves the route selling `amount` of
+    /// `token` back to the gas token, and returns what it delivers with its components. Returns
+    /// `MissingSellRoute` with the reason to help explain failures on the same block.
     fn solve_sell_leg(
         &mut self,
         token: &Address,
         amount: BigUint,
-    ) -> Result<SellLeg, FailedItemError> {
+    ) -> Result<(BigUint, FxHashSet<ComponentId>), FailedItemError> {
         let token_node = *self
             .token_nodes
             .get(token)
             .ok_or_else(|| {
                 FailedItemError::MissingSellRoute("token is not in the pass subgraph".into())
             })?;
-        let candidate_components = self
-            .ctx
-            .reroot_toward(
-                self.graph,
-                token_node,
-                self.gas_node,
-                &self.hops_to_gas,
-                self.algorithm.max_hops(),
-            )
-            .ok_or_else(|| {
-                FailedItemError::MissingSellRoute("no pruned subgraph toward the gas token".into())
-            })?;
-        let mut components: FxHashSet<ComponentId> = candidate_components
-            .into_iter()
-            .cloned()
-            .collect();
-
+        let rerooted = self.ctx.reroot_toward(
+            self.graph,
+            token_node,
+            self.gas_node,
+            &self.hops_to_gas,
+            self.algorithm.max_hops(),
+        );
+        if !rerooted {
+            return Err(FailedItemError::MissingSellRoute(
+                "no pruned subgraph toward the gas token".into(),
+            ));
+        }
         let order = Order::new(
             token.clone(),
             self.computation.gas_token.clone(),
@@ -349,13 +684,12 @@ impl<'a> PricingPass<'a> {
         if amount_out.is_zero() {
             return Err(FailedItemError::MissingSellRoute("the sell route returns zero".into()));
         }
-        components.extend(
-            route
-                .swaps()
-                .iter()
-                .map(|swap| swap.component_id().to_string()),
-        );
-        Ok(SellLeg { amount_out, components })
+        let components = route
+            .swaps()
+            .iter()
+            .map(|swap| swap.component_id().to_string())
+            .collect();
+        Ok((amount_out, components))
     }
 }
 
@@ -371,6 +705,9 @@ struct PricingPassOutcome {
     /// bailed out before solving anything. They keep their previous price and their stamp:
     /// unlike a failure, nothing is known about them this block.
     unattempted: FxHashSet<Address>,
+    /// The components that this pricing pass flagged. The first buy pass of the next
+    /// `FLAGGED_POOL_PASSES` pricing passes leaves them out.
+    new_flagged_components: FxHashSet<ComponentId>,
 }
 
 /// Computes token prices relative to the gas token from the routes that trade it.
@@ -382,33 +719,31 @@ pub struct TokenGasPriceComputation {
     max_hops: usize,
     /// Amount of gas token each probe buys with (affects slippage).
     probe_amount: BigUint,
-    /// Wall-clock budget for a pass's per-token sell loop, where nearly all of its time goes.
-    /// The window opens when the sell loop starts and is checked before each token's sell — the
-    /// snapshot and the buy pass ahead of the loop run outside it, bounded only by the per-solve
-    /// timeout. Tokens not attempted before it expires keep their previous price; the module's
-    /// Cost section says what a slow pass would otherwise delay.
+    /// Wall-clock budget for the steps of a pricing pass after its first buy pass. The snapshot
+    /// and the first buy pass run outside it, bounded only by the algorithm's timeout. Tokens not
+    /// attempted before it expires keep their previous price; the module's "Cost and time
+    /// limits" section says which steps check it and what a slow pricing pass delays.
     pass_budget: Duration,
     /// Most tokens one pass attempts. This is what bounds a pass; see `select_pass_tokens`.
     max_tokens_per_pass: usize,
     /// How long after a pass starts the next one may start. It is a lower bound on the gap
     /// between two passes, not a schedule: a pass runs when this time has elapsed *and* the
     /// market gives it something to price. The cap bounds what one pass costs; this bounds how
-    /// often one runs. See the module's "Why the pass is capped, spaced and rotated" section.
+    /// often one runs. See the module's "Spacing pricing passes" section.
     min_pass_interval: Duration,
-    /// Everything the schedule of a pass is decided from: when to run one, and which tokens
-    /// have waited longest.
+    /// What earlier pricing passes left behind: when to run the next one, which tokens have
+    /// waited longest, and which components are flagged.
     ///
     /// Shared because `compute` takes `&self`, and because the struct derives `Clone` for the
     /// `spawn_blocking` handoff.
     pass_history: Arc<Mutex<PassHistory>>,
 }
 
-/// What one pass leaves behind for the next one to schedule from.
+/// What earlier pricing passes left behind for the next one.
 #[derive(Debug, Default)]
 struct PassHistory {
     /// Passes that have run. The number a pass takes stamps every token it attempts, and the
-    /// next pass orders by that stamp; see the module's "Why the pass is capped, spaced and
-    /// rotated" section.
+    /// next pass orders by that stamp; see the module's "Selecting tokens" section.
     passes: u64,
     /// When the last whole pass started, for `min_pass_interval`.
     last_pass_started: Option<Instant>,
@@ -420,6 +755,9 @@ struct PassHistory {
     /// in no stored dependency set, so once its tokens lose the arrived rank nothing points at
     /// them again. They keep the rank until a pass attempts them.
     pending_arrivals: FxHashSet<Address>,
+    /// The flagged components, each with the number of the pricing pass that flagged it. The first
+    /// buy pass of the next `FLAGGED_POOL_PASSES` pricing passes leaves the component out.
+    flagged_components: FxHashMap<ComponentId, u64>,
 }
 
 /// How much of a pass the interval allows right now.
@@ -545,7 +883,13 @@ fn select_pass_tokens(
         .collect()
 }
 
-/// Default wall-clock backstop for a pass's sell loop.
+/// How many pricing passes a flagged pool stays out of the first buy pass. A pool can recover, so
+/// the flag expires, and the next pricing pass that routes through the pool checks it again.
+/// Passes for the tokens of added components run inside `min_pass_interval` and count too, so a
+/// flag can expire sooner than `FLAGGED_POOL_PASSES` intervals.
+const FLAGGED_POOL_PASSES: u64 = 100;
+
+/// Default wall-clock budget for a pricing pass after its first buy pass.
 ///
 /// `DEFAULT_MAX_TOKENS_PER_PASS` is what sizes a pass. This only stops one pathological token
 /// from holding the derived chain, so it stays generous.
@@ -560,10 +904,8 @@ const DEFAULT_MIN_PASS_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default cap on the tokens one pass attempts.
 ///
-/// Measured on Base at `min-tvl 1`, a sell costs about 12ms, so 100 tokens is a pass of roughly
-/// 1.2s against a 2s block. The whole market of about 2200 tokens refreshes in some 23 passes,
-/// which is the same staleness the uncapped pass had when it ran for 25 to 30 seconds at a time,
-/// for about 40% of the CPU.
+/// At 100 tokens per pass, the whole market of about 2200 tokens on Base at `min-tvl 1` refreshes
+/// in some 23 passes.
 const DEFAULT_MAX_TOKENS_PER_PASS: usize = 100;
 
 impl Default for TokenGasPriceComputation {
@@ -597,7 +939,7 @@ impl TokenGasPriceComputation {
         }
     }
 
-    /// Sets the wall-clock backstop for a pass's sell loop.
+    /// Sets the wall-clock budget for a pricing pass after its first buy pass.
     pub fn with_pass_budget(self, pass_budget: Duration) -> Self {
         Self { pass_budget, ..self }
     }
@@ -613,7 +955,7 @@ impl TokenGasPriceComputation {
         Self { min_pass_interval, ..self }
     }
 
-    /// Takes the pass state's lock.
+    /// Takes the pass history's lock.
     ///
     /// A poisoned lock is taken anyway: the guarded value only schedules passes, a panic cannot
     /// leave it half-written, and refusing to price tokens over it would be worse.
@@ -649,7 +991,7 @@ impl TokenGasPriceComputation {
     /// Snapshots what the next pass ranks its candidates by, and holds this block's arrivals
     /// until a pass attempts them.
     ///
-    /// `priced` says which tokens have a stored price; the stamps come from the pass state. The
+    /// `priced` says which tokens have a stored price; the stamps come from the pass history. The
     /// arrived rank covers the tokens of every component that has arrived since the last pass
     /// attempted them, not only this block's: the cap can cut the rank short, and a component
     /// that arrives is in no stored dependency set, so a token it carries that loses the rank
@@ -670,13 +1012,14 @@ impl TokenGasPriceComputation {
 
     /// Takes the number of the pass that just ran, stamps every token it attempted, drops the
     /// attempted tokens from the arrived rank, and forgets the tokens that left the market so
-    /// neither set can grow without bound.
+    /// neither set can grow without bound. Stores the components the pass flagged under its
+    /// number, and forgets the flags that are `FLAGGED_POOL_PASSES` passes old.
     ///
     /// Attempted means selected and not carried: a token the cap or the deadline left out comes
     /// back as unattempted and keeps whatever stamp it had. Priced and failed tokens are stamped
     /// alike, because the stamp answers "when did a pass last look at this token", which is what
     /// rotation needs from it.
-    fn record_attempts(
+    fn record_pass(
         &self,
         selected: &FxHashSet<Address>,
         outcome: &PricingPassOutcome,
@@ -700,6 +1043,23 @@ impl TokenGasPriceComputation {
         state
             .pending_arrivals
             .retain(|token| universe.contains(token));
+        for component_id in &outcome.new_flagged_components {
+            state
+                .flagged_components
+                .insert(component_id.clone(), pass);
+        }
+        state
+            .flagged_components
+            .retain(|_, flagged_in| pass.wrapping_sub(*flagged_in) < FLAGGED_POOL_PASSES);
+    }
+
+    /// Returns the components the next pricing pass leaves out of its first buy pass.
+    fn read_flagged_components(&self) -> FxHashSet<ComponentId> {
+        self.lock_pass_history()
+            .flagged_components
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Sets the longest route the algorithm may build.
@@ -751,6 +1111,7 @@ impl TokenGasPriceComputation {
                 block,
                 failed_items: Vec::new(),
                 unattempted: universe,
+                new_flagged_components: FxHashSet::default(),
             });
         }
 
@@ -781,7 +1142,7 @@ impl TokenGasPriceComputation {
         }
         let graph = graph_manager.graph();
 
-        // One snapshot serves the buy pass and every sell. The subgraph is walked one hop
+        // One snapshot serves every buy pass and every sell solve. The subgraph is walked one hop
         // beyond `max_hops`: a sell route of `max_hops` hops can start from a token that far
         // from the gas token, and the walk must include that token's outgoing edges. On a
         // filtered (incremental) run the walk is also pruned toward the filter tokens, so
@@ -805,6 +1166,7 @@ impl TokenGasPriceComputation {
                 block,
                 failed_items: Vec::new(),
                 unattempted: universe,
+                new_flagged_components: FxHashSet::default(),
             });
         };
 
@@ -815,22 +1177,29 @@ impl TokenGasPriceComputation {
             .last_updated()
             .map_or(block, |b| b.number());
 
-        // The buy pass and the sell loop are pure CPU work — every step simulates swaps against
-        // the owned snapshot and never awaits — so they run on a blocking thread instead of
-        // pinning one of the shared runtime's workers for the whole pass.
+        // A pricing pass is pure CPU work: every step simulates swaps against the owned snapshot
+        // and never awaits. It runs on a blocking thread so that it does not hold a runtime worker
+        // for its whole length.
         let computation = self.clone();
+        let flagged_components = self.read_flagged_components();
         let span = Span::current();
         let mut outcome = tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
-            let mut sell = PricingPass::new(&algorithm, graph_manager.graph(), ctx, &computation);
-            sell.sell_loop(ordered, block)
+            let mut pass = PricingPassState::new(
+                &algorithm,
+                graph_manager.graph(),
+                ctx,
+                &computation,
+                flagged_components,
+            );
+            pass.price_tokens(ordered, block)
         })
         .await
         .map_err(|join_error| {
             ComputationError::Internal(format!("token pricing pass did not complete: {join_error}"))
         })?;
         outcome.unattempted.extend(capped_out);
-        self.record_attempts(&selected, &outcome, &universe);
+        self.record_pass(&selected, &outcome, &universe);
         Ok(outcome)
     }
 

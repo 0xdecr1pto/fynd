@@ -95,27 +95,29 @@ impl BellmanFordContext {
     /// The subgraph walk and the endpoint switch belong together: re-pointing alone would leave
     /// the solve running against the previous root's subgraph. Token metadata and the market
     /// snapshot are reused as-is, so the new endpoints must lie inside the subgraph the context
-    /// was built from. Returns the walk's candidate component ids — every component on any
-    /// `token_in`-to-`token_out` path within `max_hops` — or `None` when no such path exists.
-    pub(crate) fn reroot_toward<'a>(
+    /// was built from. Returns `false`, and leaves the context unchanged, when no
+    /// `token_in`-to-`token_out` path exists within `max_hops`.
+    pub(crate) fn reroot_toward(
         &mut self,
-        graph: &'a StableDiGraph<()>,
+        graph: &StableDiGraph<()>,
         token_in_node: NodeIndex,
         token_out_node: NodeIndex,
         hops_to_token_out: &FxHashMap<NodeIndex, usize>,
         max_hops: usize,
-    ) -> Option<FxHashSet<&'a ComponentId>> {
-        let subgraph = BellmanFordAlgorithm::get_subgraph_with_hop_map(
+    ) -> bool {
+        let Some(subgraph) = BellmanFordAlgorithm::get_subgraph_with_hop_map(
             graph,
             (token_in_node, Some(token_out_node)),
             Some(hops_to_token_out),
             max_hops,
             &RouteExclusions::default(),
-        )?;
+        ) else {
+            return false;
+        };
         self.adj = subgraph.adjacency;
         self.token_in_node = token_in_node;
         self.token_out_node = Some(token_out_node);
-        Some(subgraph.component_ids)
+        true
     }
 }
 
