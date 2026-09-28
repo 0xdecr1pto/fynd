@@ -401,6 +401,13 @@ impl ComputationManager {
             .event_tx
             .send(DerivedDataEvent::NewBlock { block });
 
+        if !changed.removed.is_empty() {
+            self.store
+                .write()
+                .await
+                .drop_failures_of_removed(&changed.removed);
+        }
+
         let nodes: Vec<(ComputationId, ComputationRequirements)> = self
             .computations
             .iter()
