@@ -690,6 +690,7 @@ mod tests {
         #[rstest]
         #[case::nan("NaN")]
         #[case::negative("-0.01")]
+        #[case::one("1")]
         #[case::above_one("1.5")]
         #[case::infinite("inf")]
         fn test_validate_quote_request_rejects_slippage(#[case] slippage: &str) {

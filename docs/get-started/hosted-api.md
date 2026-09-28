@@ -533,7 +533,7 @@ A `400` carries a `code` naming what to fix. `BAD_REQUEST` means the body did no
 | `TOO_MANY_ORDERS` | `orders` holds more than 10 orders (see [Request a quote](#3-request-a-quote)) |
 | `SAME_TOKENS` | An order's `token_in` equals its `token_out` |
 | `ZERO_AMOUNT` | An order's `amount` is `0` |
-| `INVALID_SLIPPAGE` | `encoding_options.slippage` is not a number from `0` to `1` |
+| `INVALID_SLIPPAGE` | `encoding_options.slippage` is not a number from `0` to below `1` |
 | `CLIENT_FEE_TOO_HIGH` | `encoding_options.client_fee_params.bps` is above `10000` |
 
 A `200` with `orders[0].status: "no_route_found"` is **not** an HTTP error — it means the solver ran but couldn't find a profitable route for the pair at the requested size. Check `/v1/{chain}/health` (`last_update_ms: 0` means the Tycho stream isn't delivering live state yet), try a different token pair or size, or confirm the tokens have [Tycho-indexed liquidity](https://docs.propellerheads.xyz/tycho) on that chain.

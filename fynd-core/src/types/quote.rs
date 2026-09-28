@@ -711,10 +711,10 @@ impl EncodingOptions {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - `slippage` is not a number from 0 to 1
+    /// - `slippage` is not a number from 0 to below 1
     /// - the client fee is above 10,000 bps (100%)
     pub fn validate(&self) -> Result<(), EncodingOptionsError> {
-        if !(0.0..=1.0).contains(&self.slippage) {
+        if !(0.0..1.0).contains(&self.slippage) {
             return Err(EncodingOptionsError::InvalidSlippage(self.slippage));
         }
         if let Some(params) = &self.client_fee_params {
@@ -1020,8 +1020,8 @@ pub enum OrderValidationError {
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum EncodingOptionsError {
-    /// `slippage` is not a number from 0 to 1.
-    #[error("slippage must be a number from 0 to 1, got {0}")]
+    /// `slippage` is not a number from 0 to below 1.
+    #[error("slippage must be a number from 0 to below 1, got {0}")]
     InvalidSlippage(f64),
     /// The client fee is above 100%.
     #[error(
@@ -3137,12 +3137,13 @@ mod tests {
     #[rstest]
     #[case::nan(f64::NAN)]
     #[case::negative(-0.01)]
+    #[case::one(1.0)]
     #[case::above_one(1.01)]
     #[case::infinite(f64::INFINITY)]
     fn test_encoding_options_validate_rejects_slippage(#[case] slippage: f64) {
         let err = EncodingOptions::new(slippage)
             .validate()
-            .expect_err("slippage outside 0 to 1 is rejected");
+            .expect_err("slippage outside [0, 1) is rejected");
 
         assert!(matches!(err, EncodingOptionsError::InvalidSlippage(_)), "{err:?}");
     }
@@ -3150,11 +3151,11 @@ mod tests {
     #[rstest]
     #[case::zero(0.0)]
     #[case::typical(0.005)]
-    #[case::one(1.0)]
+    #[case::just_below_one(0.999)]
     fn test_encoding_options_validate_accepts_slippage(#[case] slippage: f64) {
         EncodingOptions::new(slippage)
             .validate()
-            .expect("slippage from 0 to 1 is accepted");
+            .expect("slippage in [0, 1) is accepted");
     }
 
     fn client_fee_params_with_bps(bps: u16) -> ClientFeeParams {
