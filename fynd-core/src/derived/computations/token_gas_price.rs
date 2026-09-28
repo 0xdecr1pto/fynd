@@ -400,12 +400,12 @@ pub struct TokenGasPriceComputation {
     ///
     /// Shared because `compute` takes `&self`, and because the struct derives `Clone` for the
     /// `spawn_blocking` handoff.
-    pass_state: Arc<Mutex<PassState>>,
+    pass_history: Arc<Mutex<PassHistory>>,
 }
 
 /// What one pass leaves behind for the next one to schedule from.
 #[derive(Debug, Default)]
-struct PassState {
+struct PassHistory {
     /// Passes that have run. The number a pass takes stamps every token it attempts, and the
     /// next pass orders by that stamp; see the module's "Why the pass is capped, spaced and
     /// rotated" section.
@@ -458,7 +458,7 @@ pub(crate) struct PassPriority {
     /// Tokens that have a stored price. A token that is absent has none, which is what makes it
     /// a candidate whether or not a change points at it.
     priced: FxHashSet<Address>,
-    /// The pass each token was last attempted in, from `PassState`. Absent means never
+    /// The pass each token was last attempted in, from `PassHistory`. Absent means never
     /// attempted, which ranks the token ahead of every attempted one.
     last_attempted: FxHashMap<Address, u64>,
 }
@@ -575,7 +575,7 @@ impl Default for TokenGasPriceComputation {
             pass_budget: DEFAULT_PASS_BUDGET,
             max_tokens_per_pass: DEFAULT_MAX_TOKENS_PER_PASS,
             min_pass_interval: DEFAULT_MIN_PASS_INTERVAL,
-            pass_state: Arc::new(Mutex::new(PassState::default())),
+            pass_history: Arc::new(Mutex::new(PassHistory::default())),
         }
     }
 }
@@ -617,8 +617,8 @@ impl TokenGasPriceComputation {
     ///
     /// A poisoned lock is taken anyway: the guarded value only schedules passes, a panic cannot
     /// leave it half-written, and refusing to price tokens over it would be worse.
-    fn lock_pass_state(&self) -> MutexGuard<'_, PassState> {
-        match self.pass_state.lock() {
+    fn lock_pass_history(&self) -> MutexGuard<'_, PassHistory> {
+        match self.pass_history.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -631,7 +631,7 @@ impl TokenGasPriceComputation {
     /// quoted until they are priced, but pricing them is not a reason to start the interval
     /// again or to rank the rest of the market again.
     fn start_pass(&self, arrivals: bool, must_solve: bool) -> PassSlot {
-        let mut state = self.lock_pass_state();
+        let mut state = self.lock_pass_history();
         let now = Instant::now();
         let due = state
             .last_pass_started
@@ -659,7 +659,7 @@ impl TokenGasPriceComputation {
         arrived: FxHashSet<Address>,
         priced: FxHashSet<Address>,
     ) -> PassPriority {
-        let mut state = self.lock_pass_state();
+        let mut state = self.lock_pass_history();
         state.pending_arrivals.extend(arrived);
         PassPriority {
             arrived: state.pending_arrivals.clone(),
@@ -682,7 +682,7 @@ impl TokenGasPriceComputation {
         outcome: &PricingPassOutcome,
         universe: &FxHashSet<Address>,
     ) {
-        let mut state = self.lock_pass_state();
+        let mut state = self.lock_pass_history();
         let pass = state.passes.wrapping_add(1);
         state.passes = pass;
         for token in selected {
@@ -2188,7 +2188,7 @@ mod tests {
     async fn test_a_pass_stamps_only_the_tokens_it_reprices() {
         fn stamp(computation: &TokenGasPriceComputation, token: &Address) -> u64 {
             computation
-                .lock_pass_state()
+                .lock_pass_history()
                 .last_attempted
                 .get(token)
                 .copied()
