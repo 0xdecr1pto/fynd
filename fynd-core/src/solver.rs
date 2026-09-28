@@ -1505,11 +1505,12 @@ impl Solver {
             .with_max_hop(defaults::PRICING_MAX_HOPS)
             .with_depth_slippage_threshold(DEFAULT_DEPTH_SLIPPAGE_THRESHOLD)
             // Replay tests assert exact priced-token counts against a deterministic recording, so
-            // neither bound on a pricing pass may apply: an effectively unbounded budget keeps a
-            // starved CI machine from cutting a pass short, and an unbounded cap keeps a pass
-            // from deferring tokens to a later one that the replay never runs.
+            // no bound on a pricing pass may apply: an effectively unbounded budget keeps a
+            // starved CI machine from cutting a pass short, and unbounded token and sell-solve
+            // caps keep a pass from deferring tokens to a later one that the replay never runs.
             .with_pricing_pass_budget(Duration::from_secs(24 * 60 * 60))
             .with_pricing_max_tokens_per_pass(usize::MAX)
+            .with_pricing_max_sell_solves_per_pass(usize::MAX)
             .with_pricing_min_pass_interval(Duration::ZERO);
         let (computation_manager, _) =
             ComputationManager::new(computation_config, market_data.clone())

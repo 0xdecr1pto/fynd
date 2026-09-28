@@ -66,14 +66,15 @@ impl TimedComputations {
         let gas_token =
             native_token(&settings.chain).expect("the recording's chain has a native token");
         // A 24-hour budget acts as no deadline: a pass cut short would report less time than the
-        // full pass takes. No token cap and no pass interval, so each block prices every token
-        // whose dependencies changed. The timings then measure pricing, not the cap and the
-        // interval.
+        // full pass takes. No token cap, no sell-solve cap and no pass interval, so each block
+        // prices every token whose dependencies changed. The timings then measure pricing, not
+        // the caps and the interval.
         let config = ComputationManagerConfig::new()
             .with_gas_token(gas_token)
             .with_max_hop(settings.pricing_max_hops)
             .with_pricing_pass_budget(Duration::from_secs(24 * 60 * 60))
             .with_pricing_max_tokens_per_pass(usize::MAX)
+            .with_pricing_max_sell_solves_per_pass(usize::MAX)
             .with_pricing_min_pass_interval(Duration::ZERO);
         Self {
             spot_prices: SpotPriceComputation::new(),

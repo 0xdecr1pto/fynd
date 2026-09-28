@@ -130,6 +130,9 @@ pub struct ComputationManagerConfig {
     /// Overrides how many tokens one token-pricing pass may attempt; `None` keeps the
     /// computation's default.
     pricing_max_tokens_per_pass: Option<usize>,
+    /// Overrides how many sell solves one token-pricing pass may run; `None` keeps the
+    /// computation's default.
+    pricing_max_sell_solves_per_pass: Option<usize>,
     /// Overrides how long after a token-pricing pass starts the next one may start; `None`
     /// keeps the computation's default.
     pricing_min_pass_interval: Option<Duration>,
@@ -162,6 +165,12 @@ impl ComputationManagerConfig {
     /// Overrides how many tokens one token-pricing pass may attempt.
     pub fn with_pricing_max_tokens_per_pass(mut self, max_tokens: usize) -> Self {
         self.pricing_max_tokens_per_pass = Some(max_tokens);
+        self
+    }
+
+    /// Overrides how many sell solves one token-pricing pass may run.
+    pub fn with_pricing_max_sell_solves_per_pass(mut self, max_sell_solves: usize) -> Self {
+        self.pricing_max_sell_solves_per_pass = Some(max_sell_solves);
         self
     }
 
@@ -203,6 +212,9 @@ impl ComputationManagerConfig {
         if let Some(max_tokens) = self.pricing_max_tokens_per_pass {
             token_prices = token_prices.with_max_tokens_per_pass(max_tokens);
         }
+        if let Some(max_sell_solves) = self.pricing_max_sell_solves_per_pass {
+            token_prices = token_prices.with_max_sell_solves_per_pass(max_sell_solves);
+        }
         if let Some(interval) = self.pricing_min_pass_interval {
             token_prices = token_prices.with_min_pass_interval(interval);
         }
@@ -218,6 +230,7 @@ impl Default for ComputationManagerConfig {
             depth_slippage_threshold: 0.01,
             pricing_pass_budget: None,
             pricing_max_tokens_per_pass: None,
+            pricing_max_sell_solves_per_pass: None,
             pricing_min_pass_interval: None,
         }
     }

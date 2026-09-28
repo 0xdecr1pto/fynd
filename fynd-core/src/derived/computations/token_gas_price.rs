@@ -318,10 +318,11 @@ impl<'a> PricingPassState<'a> {
     /// three steps: a reverse sell for each token, a buy pass without any flagged component for
     /// the tokens whose reverse sell reached a flagged pool, then a sell solve for each token still
     /// without a price. Sell solves are the expensive step, so they run last, in the order of
-    /// `tokens_to_price`. The deadline is checked before each reverse sell of the first step,
-    /// before the second step, and before each sell solve. So a pricing pass that the deadline
-    /// cuts short prices the front of that order, and the caller puts the tokens that must not be
-    /// dropped there. A token that no step prices is unattempted.
+    /// `tokens_to_price`, up to `max_sell_solves_per_pass` of them. The deadline is checked before
+    /// each reverse sell of the first step, before the second step, and before each sell solve. So
+    /// a pricing pass that the deadline or the cap cuts short prices the front of that order, and
+    /// the caller puts the tokens that must not be dropped there. A token that no step prices is
+    /// unattempted.
     fn price_tokens(&mut self, tokens_to_price: Vec<Address>, block: u64) -> PricingPassOutcome {
         let adjacency = self.build_adjacency_without(&self.earlier_flagged_components);
         let mut buys = self.run_buy_pass(adjacency);
@@ -340,11 +341,17 @@ impl<'a> PricingPassState<'a> {
         if Instant::now() < deadline {
             self.price_without_flagged_pools(on_flagged_routes, &mut outcomes, &mut for_sell_solve);
         }
+        let mut sell_solves = 0;
         for token in &tokens_to_price {
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline ||
+                sell_solves >=
+                    self.computation
+                        .max_sell_solves_per_pass
+            {
                 break;
             }
             if let Some(buy_leg) = for_sell_solve.remove(token) {
+                sell_solves += 1;
                 outcomes.insert(token.clone(), self.price_with_sell_solve(token, &buy_leg));
             }
         }
@@ -726,6 +733,9 @@ pub struct TokenGasPriceComputation {
     pass_budget: Duration,
     /// Most tokens one pass attempts. This is what bounds a pass; see `select_pass_tokens`.
     max_tokens_per_pass: usize,
+    /// Most sell solves one pass runs. A sell solve costs far more than a reverse sell, so this
+    /// bounds a pass in which many tokens fall back to one.
+    max_sell_solves_per_pass: usize,
     /// How long after a pass starts the next one may start. It is a lower bound on the gap
     /// between two passes, not a schedule: a pass runs when this time has elapsed *and* the
     /// market gives it something to price. The cap bounds what one pass costs; this bounds how
@@ -907,6 +917,10 @@ const DEFAULT_MIN_PASS_INTERVAL: Duration = Duration::from_secs(1);
 /// in 5 passes.
 const DEFAULT_MAX_TOKENS_PER_PASS: usize = 500;
 
+/// Default cap on the sell solves one pass runs. At about 12 ms each, 200 sell solves take about
+/// 2.4 s.
+const DEFAULT_MAX_SELL_SOLVES_PER_PASS: usize = 200;
+
 impl Default for TokenGasPriceComputation {
     fn default() -> Self {
         Self {
@@ -915,6 +929,7 @@ impl Default for TokenGasPriceComputation {
             probe_amount: BigUint::from(10u64).pow(18), // 1 ETH
             pass_budget: DEFAULT_PASS_BUDGET,
             max_tokens_per_pass: DEFAULT_MAX_TOKENS_PER_PASS,
+            max_sell_solves_per_pass: DEFAULT_MAX_SELL_SOLVES_PER_PASS,
             min_pass_interval: DEFAULT_MIN_PASS_INTERVAL,
             pass_history: Arc::new(Mutex::new(PassHistory::default())),
         }
@@ -946,6 +961,11 @@ impl TokenGasPriceComputation {
     /// Sets how many tokens one pass may attempt.
     pub fn with_max_tokens_per_pass(self, max_tokens_per_pass: usize) -> Self {
         Self { max_tokens_per_pass, ..self }
+    }
+
+    /// Sets how many sell solves one pass may run.
+    pub fn with_max_sell_solves_per_pass(self, max_sell_solves_per_pass: usize) -> Self {
+        Self { max_sell_solves_per_pass, ..self }
     }
 
     /// Sets how long after a pass starts the next one may start. `Duration::ZERO` lets a pass
