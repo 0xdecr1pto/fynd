@@ -1,123 +1,107 @@
-//! Computes token prices relative to the gas token.
+//! Computes token prices relative to the gas token after market component changes.
+//! Quotes read stored prices without waiting. A price can be several market events old because
+//! the count cap and `min_pass_interval` limit which tokens each block prices.
 //!
-//! `ComputationManager` calls `compute` in the background after market component changes. Quote
-//! requests read stored prices without waiting. Prices can remain unchanged across market events.
+//! # Computing a price
 //!
-//! # Algorithm
+//! A pricing pass uses one market snapshot for every simulation. A buy pass runs Bellman-Ford
+//! with `probe_amount` of the gas token to find each selected token's best buy route and bought
+//! amount. A reverse sell swaps that amount back along the buy route. Both include fees and
+//! slippage. Gas-aware scoring is off because it reads the prices this computation produces.
 //!
-//! A pricing pass attempts to calculate prices for selected tokens. A route is a sequence of swaps
-//! through market components, such as pools. Pricing uses the same Bellman-Ford algorithm as
-//! quotes.
+//! The price is the arithmetic mean of the buy and sell rates, kept as an exact fraction.
+//! Both rates are in token units per gas token unit: the bought amount divided by `probe_amount`
+//! or by the gas amount returned, respectively. This mean values a token lower as its round-trip
+//! loss grows. An exact fraction cannot always represent the geometric mean.
 //!
-//! Each pass simulates buying selected tokens with `probe_amount` of the gas token, then selling
-//! each bought amount back along its buy route, reversed. Both simulations include swap fees and
-//! slippage: the effect of trade size on the exchange rate. Gas-aware scoring needs the prices
-//! being calculated, so pricing disables gas-aware scoring. Pricing needs no output from another
-//! derived computation.
+//! # Flagged pools and sell solves
 //!
-//! `build_price_entry` stores the arithmetic mean of two rates as an exact fraction. Both rates
-//! express token units per gas token unit. The buy rate divides the bought amount by
-//! `probe_amount`; the sell rate divides the bought amount by the gas token amount returned. The
-//! mean understates the token's value in gas, with greater bias for larger round-trip losses. The
-//! geometric mean would be exact for equal losses in both directions, but an exact fraction cannot
-//! always represent it.
+//! A reverse sell checks each pool before swapping through it. It flags the first pool whose
+//! spot price lookup fails, whose directional spot price product is outside
+//! `VALID_SPOT_PRODUCT_RANGE`, or whose reverse swap fails or returns zero. Such a pool can
+//! quote a buy rate that the swap back cannot deliver. Each hop's spot price check runs once
+//! per pricing pass, cached by component and direction.
 //!
-//! A token dependency is a component whose changes can require a new price. `path_components`
-//! holds the components of the routes that priced the token. A change to a rival pool does not
-//! select the token: the token gets a better route only when a change to a pool on its current
-//! route selects it. `update_prices` removes the price and dependencies when an attempted token
-//! has no price.
+//! The first buy pass leaves out earlier flagged components that are in the pass's subgraph.
+//! If it finishes without reaching a token outside the subgraph, pricing marks that token
+//! unreachable without running an extra buy pass. For a token inside the subgraph, the buy pass
+//! through every pool can supply a route for a sell solve. It runs at most once, and only if the
+//! first buy pass left pools out.
 //!
-//! # Flagged pools
+//! Tokens whose reverse sell flags a pool get the second buy pass, which leaves out all pools
+//! flagged so far or in earlier pricing passes. Each reached token gets another reverse sell.
+//! If the second buy pass finishes without reaching a token, or its reverse sell flags another
+//! pool, a sell solve uses the amount the first buy pass bought. Missing simulation state or
+//! token metadata also requires a sell solve, using the route that lacked it and its bought
+//! amount; it does not flag a pool. Any buy pass timeout, including the second buy pass without
+//! flagged pools, leaves tokens it did not reach unattempted.
 //!
-//! A flagged pool is a pool whose two directions disagree: its spot price fails, its reverse swap
-//! fails or returns zero, or `spot(a→b) * spot(b→a)` is outside `VALID_SPOT_PRODUCT_RANGE`. Such
-//! a pool can sell a token at a price it does not buy it back at, and the reversed buy route
-//! would then price the token through it. The sell back flags the first such pool it reaches. A second buy
-//! pass buys every token whose sell back reached a flagged pool again, without the flagged pools,
-//! and the pass sells each back along its new route. A token that still fails gets a sell solve,
-//! as does a token that only a flagged pool reaches. The pass history keeps each flag for
-//! `FLAGGED_POOL_PASSES` passes, and the first buy pass of those passes leaves the pool out.
+//! A sell solve searches for a route back to the gas token. It can use flagged pools because it
+//! ranks routes by simulated output. A token needs a nonzero sell result to get a price: a buy
+//! rate alone would overvalue a token that is expensive to sell.
 //!
-//! # Cost
+//! `PassHistory` keeps stamps, pending arrivals, timing, and flags across pricing passes.
+//! `record_pass` stores flags. Each flag excludes its pool from the first buy pass of the next
+//! `FLAGGED_POOL_PASSES` pricing passes, then expires so the pool can be checked again.
 //!
-//! Each pass uses one market snapshot and one buy pass for all selected tokens. Each token's sell
-//! swaps once per hop of its buy route. Flagged pools add at most two buy passes per pass, and a
-//! sell solve for each token they leave without a price. A sell solve is the expensive step: it
-//! re-roots the snapshot and simulates every pool within `max_hops` of the token.
+//! # Dependencies and stored prices
 //!
-//! Token prices and spot prices run in the same stage: a group of derived computations that run
-//! together. The manager waits for the stage before storing outputs. Slow pricing therefore delays
-//! spot price storage, component depth computation, and processing of the next market event.
+//! A price's `path_components` hold its buy route's pools and, for a sell solve, its sell route's
+//! pools. A change to these dependencies makes the token eligible for a new price. A rival pool
+//! is not a dependency, so an improved rival route needs another change to make the token eligible.
 //!
-//! `pass_budget` starts after snapshot creation and the first buy pass. The pass checks the
-//! deadline before each reverse sell, before the second buy pass and before each sell solve, but
-//! does not interrupt a step already in progress. The sell solves run last, in the order the
-//! tokens were selected.
+//! An attempted token that cannot be priced loses its old price and dependencies. Tokens with
+//! no buy route count as unreachable; tokens with no sell route produce failed items.
+//! Unattempted tokens keep their price, dependencies, and stamp. If no snapshot subgraph exists
+//! around the gas token, all selected tokens stay unattempted.
 //!
-//! # Why the pass is capped, spaced and rotated
+//! # Cost and time limits
 //!
-//! Many routes share components near the gas token, so selecting tokens from changed
-//! dependencies alone does not reliably limit work.
+//! Sell solves cost more than reverse sells and run last, in selection order. Each pricing pass
+//! stops sell solves at `max_sell_solves_per_pass` (default 200) or the deadline. Tokens left over
+//! stay unattempted.
 //!
-//! `max_tokens_per_pass` caps every pass by count. `solve_token_prices` selects tokens before
-//! building the snapshot around routes toward those tokens. A time limit cannot select that set.
+//! The `pass_budget` deadline starts after the first buy pass. Snapshot creation also runs
+//! outside this budget. The deadline is checked before each token from the first buy pass,
+//! before the second buy pass, and before each sell solve. It does not interrupt running work.
+//! The second buy pass and its reverse sells have no deadline check between tokens. Buy passes
+//! and sell solves have their own algorithm timeout.
 //!
-//! ## Which tokens a pass attempts
+//! Pricing runs on a blocking thread. Token prices and spot prices share a computation stage;
+//! the manager stores no output until the stage finishes. Slow pricing delays stored spot prices,
+//! component depth computation, and handling of the next market event.
 //!
-//! A candidate is a market token that qualifies for selection. The gas token never qualifies. In a
-//! normal update, a token qualifies if an added component contains the token, the token has no
-//! stored price, or a stored dependency changes. Unpriced tokens remain eligible because no stored
-//! dependency can trigger another attempt.
+//! # Selecting tokens
 //!
-//! `select_pass_tokens` puts tokens from added components first. Stored dependencies cannot
-//! include new components, and new tokens need prices before quoting can use those tokens. Which
-//! of those tokens get the rank depends on what granted the pass: a whole pass gives it to every
-//! token an added component carries, priced or not, and a pass inside the interval gives it only
-//! to the tokens with no price. "How often a pass runs" says why. A token holds the rank until a
-//! pass attempts it, because the cap can cut the rank short and no stored dependency would name
-//! the new component afterwards. This priority does not cover other priced tokens that reach
-//! added components through further swaps. Those tokens still need a stored dependency change to
-//! qualify.
+//! The gas token needs no selection. A market token is eligible if it has no price, a dependency
+//! changed, or it is an arrival: a token of an added component. Arrivals come first because no
+//! stored dependency names a new component, and quotes need token prices. Arrivals keep this
+//! priority until attempted. Other priced tokens need a dependency change to become eligible.
 //!
-//! Passes have numbers. A token's stamp is the number of the pass that last attempted it, or zero
-//! if no pass attempted it. Both ranks order by smallest stamp first. Failed attempts update
-//! stamps, so failing tokens move behind older candidates. A token with no price has the stamp
-//! zero until a pass attempts it, so such a token comes before every token that has a price. This
-//! order spreads attempts when candidates remain eligible. A priced token excluded by the cap
-//! needs another dependency change to qualify again, unless it holds the rank of an added
-//! component.
+//! Each token's stamp records the last pricing pass that attempted it, including failures.
+//! Never-attempted tokens have stamp zero. Within each priority group, the smallest stamp comes
+//! first, so failures move behind older eligible tokens. A priced token left out by the cap needs
+//! another dependency change to become eligible again unless it keeps arrival priority.
 //!
-//! An unattempted token is a token skipped without a decision on whether a price exists. The cap,
-//! sell deadline, or a buy timeout before reaching the token can cause this. Unattempted tokens
-//! keep their previous prices, dependencies, and stamps.
+//! `max_tokens_per_pass` caps selection in every pricing pass except seeding, including passes
+//! for arrivals only. Selection precedes snapshot creation so the snapshot covers routes toward
+//! selected tokens. A deadline cannot choose these tokens, so a count cap does.
 //!
-//! ## How often a pass runs
+//! # Spacing pricing passes
 //!
-//! `min_pass_interval` spaces passes to limit repeated pricing work. A count cap alone can still
-//! allow passes to run almost continuously: on Base the cap alone left pricing at a 94% duty
-//! cycle, with passes 46 times cheaper that ran 22 times more often. A block has three outcomes:
+//! `min_pass_interval` defaults to 1 s. The interval starts with a pricing pass over all eligible
+//! tokens, not one for arrivals only. Before expiry, added components allow a capped pricing pass
+//! for pending arrivals without prices; it does not restart the interval. Otherwise, `compute`
+//! returns stored prices, or seeds prices if no price map exists.
 //!
-//! - With no previous interval, or after the interval expires, `start_pass` starts the interval
-//!   again. The pass selects up to `max_tokens_per_pass` candidates.
-//! - Before expiry, added components allow a pass for the tokens in those components that have no
-//!   price. Such a token cannot be quoted at all until a pass prices it. This pass also uses
-//!   `max_tokens_per_pass`, because the count of added components has no bound: a protocol resync
-//!   sends that protocol's whole pool set again. This pass does not start the interval again.
-//! - Before expiry, without such tokens, `compute` returns stored prices. If no price map exists,
-//!   `compute` proceeds to initialize prices.
+//! # Seeding prices
 //!
-//! ## Initializing prices
-//!
-//! Seeding rebuilds the price and dependency maps with `seed_all_prices`. When `update_prices`
-//! finds either map missing, `update_prices` returns `None`, and `compute` seeds prices. This path
-//! initializes prices at startup. Adding a component alone does not require seeding.
-//!
-//! `ChangedComponents::is_full_recompute` also forces seeding and starts the interval again. Only
-//! tests set it. `seed_all_prices` selects every market token except the gas token without a count
-//! cap. `derived_data_ready` does not require every token to have a price. A cap could therefore
-//! leave tokens unattempted at readiness even with time left for more work. Seeding avoids that
-//! cap, but the sell deadline, failures, and timeouts can still leave tokens without prices.
+//! Seeding rebuilds the price and dependency maps at startup or when either map is missing.
+//! `ChangedComponents::is_full_recompute` also forces seeding and restarts the interval.
+//! Seeding selects every market token except the gas token without a token count cap because
+//! `derived_data_ready` does not wait for every token to have a price. The sell solve cap and
+//! deadline still apply. Unattempted tokens keep their previous price and dependencies.
+//! The gas token gets a price of one and no dependencies.
 
 use std::{
     ops::RangeInclusive,
