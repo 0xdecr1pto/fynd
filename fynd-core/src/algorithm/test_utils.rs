@@ -223,16 +223,14 @@ impl ProtocolSim for MockProtocolSim {
         let token_out = params.token_out();
 
         match params.swap_constraint() {
-            SwapConstraint::TradeLimitPrice { .. } => {
+            // The mock's price does not change with the amount, so both constraints swap the whole
+            // sell limit.
+            SwapConstraint::TradeLimitPrice { .. } | SwapConstraint::PoolTargetPrice { .. } => {
                 let (sell_limit, _) =
                     self.get_limits(token_in.address.clone(), token_out.address.clone())?;
                 let result = self.get_amount_out(sell_limit.clone(), token_in, token_out)?;
                 Ok(PoolSwap::new(sell_limit, result.amount, result.new_state, None))
             }
-            _ => Err(SimulationError::InvalidInput(
-                "MockProtocolSim only supports TradeLimitPrice".to_string(),
-                None,
-            )),
         }
     }
 
@@ -425,8 +423,10 @@ impl ProtocolSim for ConstantProductSim {
         Ok((reserve_in / BigUint::from(2u64), reserve_out / BigUint::from(2u64)))
     }
 
+    /// Returns the error of tycho's default `query_pool_swap`, so `ComponentDepthComputation` falls
+    /// back to tycho's generic swap query.
     fn query_pool_swap(&self, _params: &QueryPoolSwapParams) -> Result<PoolSwap, SimulationError> {
-        unimplemented!("query_pool_swap not implemented in ConstantProductSim")
+        Err(SimulationError::FatalError("query_pool_swap not implemented".into()))
     }
 
     fn delta_transition(
