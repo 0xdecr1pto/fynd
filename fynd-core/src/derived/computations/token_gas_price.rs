@@ -2863,6 +2863,33 @@ mod tests {
         assert_eq!(deps, &FxHashSet::from_iter(["skewed".to_string()]));
     }
 
+    #[tokio::test]
+    async fn test_sell_solve_cap() {
+        // Each skewed pool is the only route to its token, so both tokens need a sell solve, and
+        // the cap of one leaves one of them unpriced.
+        let eth = token(0, "ETH");
+        let y = token(1, "Y");
+        let z = token(2, "Z");
+        let (market, _) = setup_market_weighted_boxed(vec![
+            ("skewed_y", &eth, &y, flagged_pool("skewed_spot", 0.5)),
+            ("skewed_z", &eth, &z, flagged_pool("skewed_spot", 0.5)),
+        ]);
+        let store = DerivedData::new_shared();
+
+        let prices = computation_for(&eth.address)
+            .with_max_sell_solves_per_pass(1)
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail")
+            .data;
+
+        let priced = [&y, &z]
+            .iter()
+            .filter(|token| prices.contains_key(&token.address))
+            .count();
+        assert_eq!(priced, 1);
+    }
+
     #[test]
     fn test_flag_expiry() {
         let computation = computation_for(&token(0, "ETH").address);
