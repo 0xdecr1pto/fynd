@@ -130,13 +130,14 @@ pub(crate) struct ReachOutcome {
 }
 
 /// What one relaxation delivers at a destination the source token reaches: the output amount
-/// and the components along the best path to it.
+/// and the hops of the best path to it.
 pub(crate) struct ReachedToken {
     /// What the path delivers at the destination. Never zero: a destination the relaxation
     /// leaves at zero counts as unreached and is absent from the map.
     pub(crate) amount_out: BigUint,
-    /// The components the path runs through, in hop order.
-    pub(crate) components: Vec<ComponentId>,
+    /// The path's hops in route order: the node of the token each hop sells, the node of the
+    /// token it buys, and the component it swaps through.
+    pub(crate) hops: Vec<(NodeIndex, NodeIndex, ComponentId)>,
 }
 
 /// Controls how `find_single_route` ranks candidate routes after simulation.
@@ -414,7 +415,7 @@ impl BellmanFordAlgorithm {
     }
 
     /// Every token the source token reaches, with what the best path to it delivers and the
-    /// components that path runs through, from one relaxation.
+    /// hops of that path, from one relaxation.
     ///
     /// The relaxation fills the best amount at every node, so reading all of them costs one pass
     /// rather than one per destination. Deliberately not a [`Route`] per destination:
@@ -455,12 +456,10 @@ impl BellmanFordAlgorithm {
                     continue;
                 }
             };
-            let components = path_edges
-                .into_iter()
-                .map(|(_, _, component_id)| component_id)
-                .collect();
-            reached
-                .insert(address.clone(), ReachedToken { amount_out: amount.clone(), components });
+            reached.insert(
+                address.clone(),
+                ReachedToken { amount_out: amount.clone(), hops: path_edges },
+            );
         }
 
         debug!(

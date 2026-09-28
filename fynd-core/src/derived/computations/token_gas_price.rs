@@ -288,7 +288,12 @@ impl<'a> PricingPass<'a> {
         trace!(%token, buy_out = %buy_leg.amount_out, sell_out = %sell_out, "token priced");
         // The buy path is a candidate path, so extending is defensive: it keeps the stored
         // dependencies correct even if the walk and the relaxation ever disagree.
-        components.extend(buy_leg.components.iter().cloned());
+        components.extend(
+            buy_leg
+                .hops
+                .iter()
+                .map(|(_, _, component_id)| component_id.clone()),
+        );
 
         let mid_price = Price {
             numerator: &buy_leg.amount_out * (&self.computation.probe_amount + &sell_out),
