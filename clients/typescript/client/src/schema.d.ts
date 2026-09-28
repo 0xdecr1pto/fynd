@@ -193,7 +193,7 @@ export interface components {
         ComponentDepthEntry: {
             /** @description Component (liquidity pool) identifier. */
             component_id: components["schemas"]["String"];
-            /** @description Maximum input amount before hitting the slippage threshold (decimal string). */
+            /** @description Input amount after which the pool's net marginal price has fallen by 1.5% (decimal string). */
             depth: string;
             /**
              * @description Input token address.

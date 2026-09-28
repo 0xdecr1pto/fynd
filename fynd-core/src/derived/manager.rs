@@ -100,7 +100,10 @@ fn coalesce_market_events(events: &[MarketEvent]) -> Option<ChangedComponents> {
 
 use super::{
     computation::{ComputationId, ComputationRequirements, DerivedComputation},
-    computations::{ComponentDepthComputation, SpotPriceComputation, TokenGasPriceComputation},
+    computations::{
+        component_depth::DEFAULT_MARGINAL_PRICE_DROP, ComponentDepthComputation,
+        SpotPriceComputation, TokenGasPriceComputation,
+    },
     error::ComputationError,
     events::DerivedDataEvent,
     registry::ErasedComputation,
@@ -144,9 +147,9 @@ impl ComputationManagerConfig {
         Self::default()
     }
 
-    /// Sets the slippage threshold for component depth computation.
-    pub fn with_depth_slippage_threshold(mut self, threshold: f64) -> Self {
-        self.depth_slippage_threshold = threshold;
+    /// Sets the share by which a pool's net marginal price falls at its depth.
+    pub fn with_depth_marginal_price_drop(mut self, price_drop: f64) -> Self {
+        self.depth_marginal_price_drop = price_drop;
         self
     }
 
@@ -196,9 +199,9 @@ impl ComputationManagerConfig {
         self.max_hop
     }
 
-    /// Returns the depth slippage threshold.
-    pub fn depth_slippage_threshold(&self) -> f64 {
-        self.depth_slippage_threshold
+    /// Returns the share by which a pool's net marginal price falls at its depth.
+    pub fn depth_marginal_price_drop(&self) -> f64 {
+        self.depth_marginal_price_drop
     }
 
     /// Builds the token price computation this configuration describes.
@@ -227,7 +230,7 @@ impl Default for ComputationManagerConfig {
         Self {
             gas_token: Address::zero(20),
             max_hop: crate::solver::defaults::PRICING_MAX_HOPS,
-            depth_slippage_threshold: 0.01,
+            depth_marginal_price_drop: DEFAULT_MARGINAL_PRICE_DROP,
             pricing_pass_budget: None,
             pricing_max_tokens_per_pass: None,
             pricing_max_sell_solves_per_pass: None,
@@ -270,7 +273,7 @@ impl ComputationManager {
         let (mut manager, event_rx) = Self::empty(market_data);
         manager.register(SpotPriceComputation::new())?;
         manager.register(config.build_token_price_computation())?;
-        manager.register(ComponentDepthComputation::new(config.depth_slippage_threshold())?)?;
+        manager.register(ComponentDepthComputation::new(config.depth_marginal_price_drop())?)?;
         Ok((manager, event_rx))
     }
 
@@ -915,9 +918,9 @@ mod tests {
     }
 
     #[test]
-    fn invalid_slippage_threshold_returns_error() {
+    fn invalid_depth_marginal_price_drop_returns_error() {
         let (market, _) = setup_market_weighted(vec![]);
-        let config = ComputationManagerConfig::new().with_depth_slippage_threshold(1.5);
+        let config = ComputationManagerConfig::new().with_depth_marginal_price_drop(1.5);
 
         let result = ComputationManager::new(config, market);
         assert!(matches!(result, Err(ComputationError::InvalidConfiguration(_))));

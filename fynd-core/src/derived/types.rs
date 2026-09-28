@@ -31,9 +31,8 @@ pub type SpotPrices = FxHashMap<SpotPriceKey, f64>;
 /// Uniquely identifies a directional liquidity depth within a specific component.
 pub type ComponentDepthKey = (ComponentId, Address, Address);
 
-/// Component depths map: key -> maximum input amount at the configured slippage threshold.
-///
-/// Represents how much can be traded before the specified price impact.
+/// Component depths map: key -> the input after which the pool's net marginal price has fallen by
+/// the configured marginal price drop.
 pub type ComponentDepths = FxHashMap<ComponentDepthKey, BigUint>;
 
 // =============================================================================

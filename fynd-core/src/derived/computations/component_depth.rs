@@ -1,9 +1,9 @@
 //! Component depth computation.
 //!
-//! Computes liquidity depths for all components using `query_pool_swap`, falling back to
-//! the generic Brent solver from tycho-simulation when the component doesn't implement it natively.
-//! Depth represents the maximum input amount before reaching the configured slippage
-//! threshold from the spot price.
+//! Computes the depth of every component with `query_pool_swap` and a `PoolTargetPrice`
+//! constraint. A component that does not answer that query uses tycho's generic search. The depth
+//! is the input after which the pool's marginal price, net of its fee, has fallen by the configured
+//! marginal price drop.
 //!
 //! # Dependencies
 //!
@@ -14,7 +14,7 @@
 use async_trait::async_trait;
 use itertools::Itertools;
 use num_bigint::BigUint;
-use num_traits::Zero;
+use num_traits::{Float, One};
 use rustc_hash::FxHashSet;
 use tracing::{debug, instrument, warn, Span};
 use tycho_simulation::{
@@ -40,37 +40,62 @@ use crate::{
     types::ComponentId,
 };
 
+/// Converts `price`, in whole tokens of `token_out` per whole token of `token_in`, to the exact
+/// fraction of smallest units that `query_pool_swap` reads.
+fn to_raw_price(price: f64, decimals_in: u32, decimals_out: u32) -> Price {
+    let (mantissa, exponent, _) = price.integer_decode();
+    let mut numerator = BigUint::from(mantissa);
+    let mut denominator = BigUint::one();
+    let shift = usize::from(exponent.unsigned_abs());
+    if exponent >= 0 {
+        numerator <<= shift;
+    } else {
+        denominator <<= shift;
+    }
+    if decimals_out >= decimals_in {
+        numerator *= BigUint::from(10u32).pow(decimals_out - decimals_in);
+    } else {
+        denominator *= BigUint::from(10u32).pow(decimals_in - decimals_out);
+    }
+    Price::new(numerator, denominator)
+}
+
+/// The default share by which a pool's net marginal price falls at its depth.
+pub(crate) const DEFAULT_MARGINAL_PRICE_DROP: f64 = 0.015;
+
 /// Computes component depths for all components in all directions.
 ///
-/// For each component and token pair, uses `query_pool_swap` (with Brent solver fallback)
-/// to find the maximum input amount that results in at most the configured slippage
-/// from spot price.
+/// For each component and token pair, finds the input after which the pool's marginal price,
+/// net of its fee, has fallen by `marginal_price_drop`: with `query_pool_swap` and a
+/// `PoolTargetPrice` constraint, or with tycho's generic search for a pool that has no such query.
 #[derive(Debug)]
 pub struct ComponentDepthComputation {
-    slippage_threshold: f64,
+    /// The share by which the pool's net marginal price falls at the depth.
+    marginal_price_drop: f64,
 }
 
 impl Default for ComponentDepthComputation {
     fn default() -> Self {
-        Self { slippage_threshold: 0.01 }
+        Self { marginal_price_drop: DEFAULT_MARGINAL_PRICE_DROP }
     }
 }
 
 impl ComponentDepthComputation {
-    /// Creates a new ComponentDepthComputation with the given slippage threshold.
+    /// Creates a new ComponentDepthComputation with the given marginal price drop.
     ///
     /// # Arguments
-    /// * `slippage_threshold` - Value between 0 and 1 exclusive (e.g., 0.01 for 1%)
+    /// * `marginal_price_drop` - The share by which the pool's net marginal price falls at the
+    ///   depth, between 0 and 1 exclusive (e.g., 0.015 for 1.5%)
     ///
     /// # Errors
-    /// Returns `InvalidConfiguration` if slippage_threshold is not in (0, 1).
-    pub fn new(slippage_threshold: f64) -> Result<Self, ComputationError> {
-        if !(slippage_threshold > 0.0 && slippage_threshold < 1.0) {
+    /// Returns `InvalidConfiguration` if marginal_price_drop is not in (0, 1).
+    pub fn new(marginal_price_drop: f64) -> Result<Self, ComputationError> {
+        if !(marginal_price_drop > 0.0 && marginal_price_drop < 1.0) {
             return Err(ComputationError::InvalidConfiguration(format!(
-                "slippage_threshold must be between 0 and 1 exclusive, got {slippage_threshold}"
+                "marginal_price_drop must be between 0 and 1 exclusive, got {marginal_price_drop}"
             )));
         }
-        Ok(Self { slippage_threshold })
+        Ok(Self { marginal_price_drop })
     }
 }
 
@@ -200,7 +225,6 @@ impl DerivedComputation for ComponentDepthComputation {
                 let key =
                     (component_id.clone(), token_in.address.clone(), token_out.address.clone());
 
-                // Look up precomputed spot price
                 let Some(spot_price) = spot_prices.get(&key) else {
                     warn!(
                         component_id,
@@ -215,61 +239,40 @@ impl DerivedComputation for ComponentDepthComputation {
                     });
                     continue;
                 };
-
-                let min_price = spot_price * (1.0 - self.slippage_threshold);
-
-                // Price is a raw fraction (numerator/denominator) that query_pool_swap
-                // converts back to f64 by multiplying by 10^(dec_in - dec_out). We keep
-                // the f64→u128 multiply at a fixed precision scale and absorb the decimal
-                // adjustment into the BigUint denominator.
-                const SCALE_EXP: i32 = 18;
-                let decimal_diff = token_in.decimals as i32 - token_out.decimals as i32;
-                let denominator_exp = SCALE_EXP + decimal_diff;
-                if denominator_exp < 0 {
-                    warn!(
-                        component_id,
-                        token_in = %token_in.address,
-                        token_out = %token_out.address,
-                        "extreme decimal mismatch ({}→{}), skipping pair",
-                        token_in.decimals, token_out.decimals
-                    );
-                    component_depths.remove(&key);
-                    failed_items.push(FailedItem {
-                        key: format!("{}/{}/{}", component_id, token_in.address, token_out.address),
-                        error: FailedItemError::ExtremeDecimalMismatch {
-                            from: token_in.decimals,
-                            to: token_out.decimals,
-                        },
+                // tycho's `PoolTargetPrice` compares its target with the price net of the pool's
+                // fee. `spot_price` adds the fee for some pools (Uniswap V2 and V3) and is net of
+                // it for others (many Uniswap V4 pools), so the net price is the lower of
+                // `spot(in→out)` and `1 / spot(out→in)`. Without a reverse spot price, the forward
+                // one is the marginal price.
+                let reverse_key =
+                    (component_id.clone(), token_out.address.clone(), token_in.address.clone());
+                let marginal_price = spot_prices
+                    .get(&reverse_key)
+                    .map_or(*spot_price, |reverse_spot_price| {
+                        spot_price.min(1.0 / reverse_spot_price)
                     });
-                    continue;
-                }
-
-                let numerator = BigUint::from((min_price * 10_f64.powi(SCALE_EXP)) as u128);
-                let denominator = BigUint::from(10u64).pow(denominator_exp as u32);
-
-                if numerator.is_zero() {
+                let target_price = marginal_price * (1.0 - self.marginal_price_drop);
+                if !(target_price.is_finite() && target_price > 0.0) {
                     debug!(
                         component_id,
                         token_in = %token_in.address,
                         token_out = %token_out.address,
-                        spot_price,
-                        "spot price too small to compute depth, skipping pair"
+                        marginal_price,
+                        "target price is not a positive finite number, skipping pair"
                     );
                     component_depths.remove(&key);
                     failed_items.push(FailedItem {
                         key: format!("{}/{}/{}", component_id, token_in.address, token_out.address),
-                        error: FailedItemError::SpotPriceTooSmall(*spot_price),
+                        error: FailedItemError::InvalidTargetPrice(target_price),
                     });
                     continue;
                 }
 
-                let limit_price = Price::new(numerator, denominator);
-
                 let params = QueryPoolSwapParams::new(
                     (**token_in).clone(),
                     (**token_out).clone(),
-                    SwapConstraint::TradeLimitPrice {
-                        limit: limit_price,
+                    SwapConstraint::PoolTargetPrice {
+                        target: to_raw_price(target_price, token_in.decimals, token_out.decimals),
                         tolerance: 0.0,
                         min_amount_in: None,
                         max_amount_in: None,
@@ -277,23 +280,17 @@ impl DerivedComputation for ComponentDepthComputation {
                 );
 
                 let depth_result = match sim_state.query_pool_swap(&params) {
-                    Ok(swap) => Ok(swap),
                     Err(SimulationError::FatalError(msg))
                         if msg == "query_pool_swap not implemented" =>
                     {
                         query_pool_swap(sim_state, &params)
                     }
-                    Err(SimulationError::InvalidInput(msg, _))
-                        if msg.contains("does not support TradeLimitPrice") =>
-                    {
-                        query_pool_swap(sim_state, &params)
-                    }
-                    Err(e) => Err(e),
+                    result => result,
                 }
                 .map(|swap| swap.amount_in().clone())
                 .map_err(|e| {
                     ComputationError::SimulationFailed(format!(
-                        "query_pool_swap failed for {}/{}: {e}",
+                        "depth query failed for {}/{}: {e}",
                         token_in.address, token_out.address
                     ))
                 });
@@ -319,8 +316,8 @@ impl DerivedComputation for ComponentDepthComputation {
                             component_id,
                             token_in = %token_in.address,
                             token_out = %token_out.address,
-                            spot_price,
-                            min_price,
+                            marginal_price,
+                            target_price,
                             probe_info,
                             limits_info,
                             error = %e,

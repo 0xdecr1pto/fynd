@@ -363,7 +363,7 @@
           },
           "depth": {
             "type": "string",
-            "description": "Maximum input amount before hitting the slippage threshold (decimal string)."
+            "description": "Input amount after which the pool's net marginal price has fallen by 1.5% (decimal string)."
           },
           "token_in": {
             "type": "string",

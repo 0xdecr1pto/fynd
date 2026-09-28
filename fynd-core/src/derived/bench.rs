@@ -79,8 +79,8 @@ impl TimedComputations {
         Self {
             spot_prices: SpotPriceComputation::new(),
             token_prices: config.build_token_price_computation(),
-            pool_depths: ComponentDepthComputation::new(config.depth_slippage_threshold())
-                .expect("the default depth slippage threshold is valid"),
+            pool_depths: ComponentDepthComputation::new(config.depth_marginal_price_drop())
+                .expect("the default depth marginal price drop is valid"),
         }
     }
 

@@ -108,7 +108,6 @@ pub mod defaults {
 
 // Internal-only defaults not shared with downstream crates.
 const DEFAULT_TYCHO_USE_TLS: bool = true;
-const DEFAULT_DEPTH_SLIPPAGE_THRESHOLD: f64 = 0.01;
 /// Generous router timeout for standalone (non-server) use. HTTP services should
 /// override this to a tighter value appropriate for their SLA.
 const DEFAULT_ROUTER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -913,8 +912,7 @@ impl FyndBuilder {
         let gas_token = native_token(&self.chain).map_err(|_| SolverBuildError::GasToken)?;
         let mut computation_config = ComputationManagerConfig::new()
             .with_gas_token(gas_token)
-            .with_max_hop(self.pricing_max_hops)
-            .with_depth_slippage_threshold(DEFAULT_DEPTH_SLIPPAGE_THRESHOLD);
+            .with_max_hop(self.pricing_max_hops);
         if let Some(max_tokens) = self.pricing_max_tokens_per_pass {
             computation_config = computation_config.with_pricing_max_tokens_per_pass(max_tokens);
         }
@@ -1503,7 +1501,6 @@ impl Solver {
         let computation_config = ComputationManagerConfig::new()
             .with_gas_token(gas_token)
             .with_max_hop(defaults::PRICING_MAX_HOPS)
-            .with_depth_slippage_threshold(DEFAULT_DEPTH_SLIPPAGE_THRESHOLD)
             // Replay tests assert exact priced-token counts against a deterministic recording, so
             // no bound on a pricing pass may apply: an effectively unbounded budget keeps a
             // starved CI machine from cutting a pass short, and unbounded token and sell-solve
