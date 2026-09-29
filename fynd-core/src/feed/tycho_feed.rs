@@ -93,21 +93,22 @@ pub(crate) struct PendingFeedSetup {
 }
 
 impl PendingFeedSetup {
-    /// A setup that delivers the pending processor alone; blocks flow ungated.
+    /// A setup that delivers the pending processor alone; blocks flow freely.
     pub(crate) fn new(pending_tx: oneshot::Sender<Result<PendingBlockProcessor, String>>) -> Self {
         Self { pending_tx, step_tx: None }
     }
 
-    /// A setup that also delivers a [`BlockStepController`], gating every block behind it.
+    /// A setup that also delivers a [`BlockStepController`], which holds each block until
+    /// the caller releases it.
     #[cfg(feature = "experimental")]
-    pub(crate) fn gated(
+    pub(crate) fn new_with_step_controller(
         pending_tx: oneshot::Sender<Result<PendingBlockProcessor, String>>,
         step_tx: oneshot::Sender<Result<BlockStepController, String>>,
     ) -> Self {
         Self { pending_tx, step_tx: Some(step_tx) }
     }
 
-    fn gates_blocks(&self) -> bool {
+    fn needs_step_controller(&self) -> bool {
         self.step_tx.is_some()
     }
 
@@ -131,7 +132,7 @@ impl PendingFeedSetup {
             if step_tx.send(Ok(controller)).is_err() {
                 tracing::warn!(
                     "BlockStepController receiver dropped before send; the dropped controller \
-                     leaves the stream ungated"
+                     lets blocks flow freely"
                 );
             }
         }
@@ -357,11 +358,12 @@ impl TychoFeed {
     /// and delivers the [`PendingBlockProcessor`] via `setup` before entering the stream
     /// loop.
     ///
-    /// When `setup` carries a step channel, every block is gated behind the
+    /// When `setup` carries a step channel, every block is held by the
     /// [`BlockStepController`] delivered on it: the caller must call
     /// [`BlockStepController::trigger_next_block`] for each block to be processed, and
-    /// dropping the controller ungates the stream. Gating needs at least one Tycho-streamed
-    /// protocol; a configuration without one fails with [`DataFeedError::Config`].
+    /// dropping the controller lets blocks flow freely. The controller needs at least one
+    /// Tycho-streamed protocol; a configuration without one fails with
+    /// [`DataFeedError::Config`].
     ///
     /// If setup fails before the handles can be created, the error message is sent through
     /// every channel so the caller can surface the root cause instead of seeing only
@@ -378,11 +380,11 @@ impl TychoFeed {
         info!(
             tycho_url = %self.config.tycho_url,
             protocols = ?self.config.protocols,
-            gated = setup.gates_blocks(),
+            step_controlled = setup.needs_step_controller(),
             "Starting Data Feed (with pending)..."
         );
 
-        if setup.gates_blocks() && !has_tycho_protocols(&self.config.protocols) {
+        if setup.needs_step_controller() && !has_tycho_protocols(&self.config.protocols) {
             let msg = "step controller requires at least one Tycho-streamed protocol".to_string();
             setup.fail(&msg);
             return Err(DataFeedError::Config(msg));
@@ -470,9 +472,9 @@ impl TychoFeed {
             };
         }
 
-        // `build_with_pending` wires the gating itself once `with_step_controller` has been
-        // called, so one build serves both the gated and the free-running feed.
-        let (stream_builder, controller) = if setup.gates_blocks() {
+        // `build_with_pending` hands blocks to the step controller once `with_step_controller`
+        // has been called, so one build serves both the stepped and the free-running feed.
+        let (stream_builder, controller) = if setup.needs_step_controller() {
             let (stream_builder, controller) = stream_builder.with_step_controller();
             (stream_builder, Some(controller))
         } else {

@@ -1118,7 +1118,7 @@ impl FyndBuilder {
     /// Returns [`SolverBuildError`] if any component fails to initialize.
     pub fn build(self) -> Result<Solver, SolverBuildError> {
         let components = self.assemble_components()?;
-        Ok(Self::start(components, |tycho_feed, _pending_indexers| tycho_feed.run()))
+        Ok(Self::spawn_tasks(components, |tycho_feed, _pending_indexers| tycho_feed.run()))
     }
 
     /// Assembles and starts all solver components, also returning a [`PendingBlockProcessor`]
@@ -1136,7 +1136,7 @@ impl FyndBuilder {
         self,
     ) -> Result<(Solver, PendingBlockProcessor), SolverBuildError> {
         let (pending_tx, pending_rx) = oneshot::channel::<Result<PendingBlockProcessor, String>>();
-        let solver = self.start_with_pending(PendingFeedSetup::new(pending_tx))?;
+        let solver = self.build_with_feed_setup(PendingFeedSetup::new(pending_tx))?;
         let pending = pending_rx
             .await
             .map_err(|_| SolverBuildError::PendingChannelClosed)?
@@ -1151,7 +1151,7 @@ impl FyndBuilder {
     /// Intended for deterministic testing against pending state: hold the feed one block behind
     /// the chain with [`BlockStepController::peek_next_block`], overlay the block that really
     /// came next through the processor, then call [`BlockStepController::trigger_next_block`]
-    /// to advance. Dropping the controller ungates the stream so it runs to its natural end.
+    /// to advance. Dropping the controller lets blocks flow freely until the stream ends.
     ///
     /// Only valid when at least one Tycho-streamed protocol is configured.
     ///
@@ -1166,7 +1166,10 @@ impl FyndBuilder {
         let (pending_tx, pending_rx) = oneshot::channel::<Result<PendingBlockProcessor, String>>();
         let (controller_tx, controller_rx) =
             oneshot::channel::<Result<BlockStepController, String>>();
-        let solver = self.start_with_pending(PendingFeedSetup::gated(pending_tx, controller_tx))?;
+        let solver = self.build_with_feed_setup(PendingFeedSetup::new_with_step_controller(
+            pending_tx,
+            controller_tx,
+        ))?;
         let pending = pending_rx
             .await
             .map_err(|_| SolverBuildError::PendingChannelClosed)?
@@ -1195,9 +1198,9 @@ impl FyndBuilder {
         Ok((solver, controller))
     }
 
-    fn start_with_pending(self, setup: PendingFeedSetup) -> Result<Solver, SolverBuildError> {
+    fn build_with_feed_setup(self, setup: PendingFeedSetup) -> Result<Solver, SolverBuildError> {
         let components = self.assemble_components()?;
-        Ok(Self::start(components, move |tycho_feed, pending_indexers| {
+        Ok(Self::spawn_tasks(components, move |tycho_feed, pending_indexers| {
             tycho_feed.run_with_pending(setup, pending_indexers)
         }))
     }
@@ -1206,7 +1209,7 @@ impl FyndBuilder {
     ///
     /// `run_feed` chooses how the Tycho feed runs; everything else is the same for every build
     /// path.
-    fn start<F, Fut>(components: BuiltComponents, run_feed: F) -> Solver
+    fn spawn_tasks<F, Fut>(components: BuiltComponents, run_feed: F) -> Solver
     where
         F: FnOnce(TychoFeed, Vec<(String, Box<dyn TxDeltaIndexer>)>) -> Fut,
         Fut: Future<Output = Result<(), DataFeedError>> + Send + 'static,
