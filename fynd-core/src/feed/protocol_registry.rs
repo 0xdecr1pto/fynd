@@ -356,10 +356,9 @@ fn register_exchange(
         "uniswap_v4" => builder.exchange::<UniswapV4State>("uniswap_v4", tvl_filter.clone(), None),
         "ekubo_v2" => builder.exchange::<EkuboState>("ekubo_v2", tvl_filter.clone(), None),
         "vm:curve" => {
-            // The hybrid CurveState with tycho-simulation's own curve_filter, which drops
-            // the components CurveState cannot quote correctly (oracle/rate-bearing/rebasing
-            // coins) — the source of the overestimation that forced the temporary
-            // full-EVM fallback (see #318); fixed upstream in tycho-simulation 0.338.0.
+            // Tycho's curve_filter keeps standard coins and, since 0.428.0, oracle coins
+            // with trusted rate providers (including weETH getRate()). Untrusted oracle,
+            // rebasing and ERC4626 coins remain excluded from the hybrid CurveState.
             builder.exchange::<CurveState>("vm:curve", tvl_filter.clone(), Some(curve_filter))
         }
         "uniswap_v4_hooks" => builder.exchange::<UniswapV4State>(
@@ -816,6 +815,49 @@ mod tests {
     #[case::no_hook(None, true)]
     fn test_uniswap_v4_hook_filter(#[case] hook: Option<&str>, #[case] kept: bool) {
         assert_eq!(uniswap_v4_hook_filter(&uniswap_v4_component(hook)), kept);
+    }
+
+    // Guard the upstream filter behavior Fynd relies on when updating Tycho dependencies.
+    #[rstest::rstest]
+    #[case::trusted_weeth("0x01", "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee", "0x679aefce", true)]
+    #[case::untrusted_oracle(
+        "0x01",
+        "0x1111111111111111111111111111111111111111",
+        "0x679aefce",
+        false
+    )]
+    #[case::wrong_method("0x01", "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee", "0x12345678", false)]
+    #[case::rebasing("0x02", "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee", "0x679aefce", false)]
+    #[case::erc4626("0x03", "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee", "0x679aefce", false)]
+    fn test_curve_filter_trusted_rate_provider(
+        #[case] asset_type: &str,
+        #[case] oracle: &str,
+        #[case] method_id: &str,
+        #[case] kept: bool,
+    ) {
+        use tycho_simulation::tycho_common::models::protocol::{
+            ProtocolComponent, ProtocolComponentState,
+        };
+
+        let static_attributes = [
+            ("asset_types", vec!["0x00", asset_type]),
+            ("oracles", vec!["0x0000000000000000000000000000000000000000", oracle]),
+            ("method_ids", vec!["0x00000000", method_id]),
+        ]
+        .into_iter()
+        .map(|(key, values)| (key.to_string(), Bytes::from(serde_json::to_vec(&values).unwrap())))
+        .collect();
+        let component = ComponentWithState {
+            component: ProtocolComponent {
+                protocol_system: "vm:curve".to_string(),
+                static_attributes,
+                ..Default::default()
+            },
+            state: ProtocolComponentState::new("curve_pool", HashMap::new(), HashMap::new()),
+            component_tvl: None,
+            entrypoints: vec![],
+        };
+        assert_eq!(curve_filter(&component), kept);
     }
 
     fn register(entries: &[&str]) -> Result<ProtocolStreamBuilder, DataFeedError> {
