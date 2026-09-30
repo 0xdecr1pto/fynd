@@ -2143,6 +2143,34 @@ mod tests {
         assert_eq!(ordered, vec![unpriced, stale], "the cap keeps the two highest ranks");
     }
 
+    #[test]
+    fn test_select_pass_tokens_stale_price() {
+        let stale = token(1, "AAA").address;
+        let recent = token(2, "BBB").address;
+        let universe: FxHashSet<Address> = [stale.clone(), recent.clone()]
+            .into_iter()
+            .collect();
+        let passes = MAX_PRICE_AGE_PASSES + 10;
+        let priority = PassPriority {
+            arrived: FxHashSet::default(),
+            priced: universe.clone(),
+            last_attempted: [(stale.clone(), 10), (recent.clone(), 11)]
+                .into_iter()
+                .collect(),
+            passes,
+        };
+
+        let ordered = select_pass_tokens(
+            &universe,
+            Some(&FxHashSet::default()),
+            &priority,
+            PassScope::Whole,
+            usize::MAX,
+        );
+
+        assert_eq!(ordered, vec![stale]);
+    }
+
     /// A block inside the interval serves the stored prices instead of running a pass.
     #[tokio::test]
     async fn test_a_pass_inside_the_interval_serves_the_stored_prices() {
