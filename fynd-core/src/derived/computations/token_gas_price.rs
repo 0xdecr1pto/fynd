@@ -2853,6 +2853,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_failure_of_removed_token() {
+        // ONEWAY cannot sell back, so the first pass stores its failure. Its only pool then
+        // leaves the market, and the next pass drops the failure with it.
+        let eth = token(0, "ETH");
+        let oneway = token(1, "ONEWAY");
+        let bbb = token(2, "BBB");
+        let (market, _) = setup_market_weighted(vec![
+            (
+                "eth_oneway",
+                &eth,
+                &oneway,
+                MockProtocolSim::new(0.5).with_liquidity(600_000_000_000_000_000),
+            ),
+            ("eth_bbb", &eth, &bbb, MockProtocolSim::new(2500.0)),
+        ]);
+        let store = DerivedData::new_shared();
+        let computation = computation_for(&eth.address);
+        let full = computation
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail");
+        TokenGasPriceComputation::persist(&mut *store.write().await, full, 1, true);
+        let failure_before = store
+            .read()
+            .await
+            .token_price_failure(&oneway.address)
+            .is_some();
+
+        market
+            .write()
+            .await
+            .remove_components([&"eth_oneway".to_string()]);
+        let removed =
+            ChangedComponents { removed: vec!["eth_oneway".to_string()], ..Default::default() };
+        let output = computation
+            .compute(&market, &store, &removed)
+            .await
+            .expect("pricing must not fail");
+        TokenGasPriceComputation::persist(&mut *store.write().await, output, 2, false);
+
+        assert!(failure_before);
+        assert!(store
+            .read()
+            .await
+            .token_price_failure(&oneway.address)
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_token_only_a_flagged_pool_reaches() {
         // The skewed pool is the only route to Y and its swaps work, so a sell solve through it
         // prices Y at 0.5 on both pricing passes. The second pricing pass's first buy pass leaves
