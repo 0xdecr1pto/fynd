@@ -1,4 +1,23 @@
 
+## [0.110.3](https://github.com/propeller-heads/fynd/compare/0.110.2...0.110.3) (2026-09-28)
+
+### Features
+
+* **rpc:** reject invalid slippage and client fee with per-rule codes ([6cfd995](https://github.com/propeller-heads/fynd/commit/6cfd995871312870850057d9d04a12e3cba82f44))
+* **rpc:** let an embedding service push its own quote records ([6020372](https://github.com/propeller-heads/fynd/commit/6020372c05eb1621cfa168cdabb0dfecf2fbe772))
+
+### Bug Fixes
+
+* **rpc:** reject a slippage of exactly 1 ([3975355](https://github.com/propeller-heads/fynd/commit/3975355784f6723a341043e149b660429507578e))
+
+
+## [0.110.2](https://github.com/propeller-heads/fynd/compare/0.110.1...0.110.2) (2026-09-25)
+
+### Bug Fixes
+
+* **deps:** require tycho 0.427.0 for the Titan data host ([ff6f305](https://github.com/propeller-heads/fynd/commit/ff6f305eda8ead746b0bb9342fe89d8fdc078e27))
+
+
 ## [0.110.1](https://github.com/propeller-heads/fynd/compare/0.110.0...0.110.1) (2026-09-25)
 
 ### Features
