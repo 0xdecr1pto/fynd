@@ -349,9 +349,7 @@ fn register_exchange(
         "robinswap_v3" => {
             builder.exchange::<UniswapV3State>("robinswap_v3", tvl_filter.clone(), None)
         }
-        "gigadex_v3" => {
-            builder.exchange::<UniswapV3State>("gigadex_v3", tvl_filter.clone(), None)
-        }
+        "gigadex_v3" => builder.exchange::<UniswapV3State>("gigadex_v3", tvl_filter.clone(), None),
         "ramses_v3" => builder.exchange::<RamsesV3State>("ramses_v3", tvl_filter.clone(), None),
         "pancakeswap_v3" => {
             builder.exchange::<UniswapV3State>("pancakeswap_v3", tvl_filter.clone(), None)
