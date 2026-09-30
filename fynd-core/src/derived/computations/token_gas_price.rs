@@ -12,7 +12,8 @@
 //! The price is the arithmetic mean of the buy and sell rates, kept as an exact fraction.
 //! Both rates are in token units per gas token unit: the bought amount divided by `probe_amount`
 //! or by the gas amount returned, respectively. This mean values a token lower as its round-trip
-//! loss grows. An exact fraction cannot always represent the geometric mean.
+//! loss grows. An exact fraction cannot always represent the geometric mean. The next section
+//! gives the one exception.
 //!
 //! # Flagged pools and sell solves
 //!
@@ -39,6 +40,10 @@
 //! A sell solve searches for a route back to the gas token. It can use flagged pools because it
 //! ranks routes by simulated output. A token needs a nonzero sell result to get a price: a buy
 //! rate alone would overvalue a token that is expensive to sell.
+//!
+//! When the bought amount comes from a route through a flagged pool, the price is the sell rate
+//! alone: the amount sold divided by the gas token amount returned. The flagged pool can quote a
+//! wrong buy amount, and the mean would carry half of that error into the price.
 //!
 //! `PassHistory` keeps stamps, pending arrivals, timing, and flags across pricing passes.
 //! `record_pass` stores flags. Each flag excludes its pool from the first buy pass of the next
@@ -203,7 +208,16 @@ struct QueuedTokens {
     /// Tokens whose reverse sell reached a flagged pool, with the buy route that reached it.
     on_flagged_routes: FxHashMap<Address, ReachedToken>,
     /// Tokens to price with a sell solve, with the buy route whose amount the sell solve sells.
-    for_sell_solve: FxHashMap<Address, ReachedToken>,
+    for_sell_solve: FxHashMap<Address, SellSolveBuyLeg>,
+}
+
+/// The buy route whose bought amount a sell solve sells.
+enum SellSolveBuyLeg {
+    /// A route with no flagged pool. The price is the mean of the buy and sell rates.
+    Trusted(ReachedToken),
+    /// A route through a flagged pool. Its bought amount can be wrong, so the price is the sell
+    /// rate alone.
+    ThroughFlaggedPool(ReachedToken),
 }
 
 /// The result of a reverse sell along a token's buy route.
@@ -227,6 +241,23 @@ enum PoolFlagReason {
     SwapFailed,
     /// The reverse swap simulation returns zero.
     ZeroOutput,
+}
+
+/// Returns the components of every hop of `buy_leg`.
+fn collect_route_components(buy_leg: &ReachedToken) -> FxHashSet<ComponentId> {
+    buy_leg
+        .hops
+        .iter()
+        .map(|(_, _, component_id)| component_id.clone())
+        .collect()
+}
+
+/// Prices a token at the sell rate alone: the amount sold divided by the gas token amount
+/// returned. Stores the buy route's components as its dependencies.
+fn build_sell_rate_entry(buy_leg: &ReachedToken, sell_out: BigUint) -> TokenPriceEntry {
+    let path_components = collect_route_components(buy_leg);
+    let sell_rate = Price { numerator: buy_leg.amount_out.clone(), denominator: sell_out };
+    TokenPriceEntry { price: sell_rate, path_components }
 }
 
 /// Returns why the pool's two spot prices between `token_in` and `token_out` fail the check, or
@@ -382,7 +413,7 @@ impl<'a> PricingPassState<'a> {
             ReverseSellOutcome::MissingHopData => {
                 queued
                     .for_sell_solve
-                    .insert(token.clone(), buy_leg);
+                    .insert(token.clone(), SellSolveBuyLeg::Trusted(buy_leg));
                 None
             }
         }
@@ -418,7 +449,7 @@ impl<'a> PricingPassState<'a> {
             Some(buy_leg) => {
                 queued
                     .for_sell_solve
-                    .insert(token.clone(), buy_leg);
+                    .insert(token.clone(), SellSolveBuyLeg::ThroughFlaggedPool(buy_leg));
                 None
             }
             None if buys.timed_out => Some(TokenPricingOutcome::Unattempted),
@@ -471,7 +502,7 @@ impl<'a> PricingPassState<'a> {
         &mut self,
         on_flagged_routes: FxHashMap<Address, ReachedToken>,
         outcomes: &mut FxHashMap<Address, TokenPricingOutcome>,
-        for_sell_solve: &mut FxHashMap<Address, ReachedToken>,
+        for_sell_solve: &mut FxHashMap<Address, SellSolveBuyLeg>,
     ) {
         if on_flagged_routes.is_empty() {
             return;
@@ -487,7 +518,8 @@ impl<'a> PricingPassState<'a> {
         for (token, flagged_route) in on_flagged_routes {
             let Some(buy_leg) = buys.reached.remove(&token) else {
                 if !buys.timed_out {
-                    for_sell_solve.insert(token, flagged_route);
+                    for_sell_solve
+                        .insert(token, SellSolveBuyLeg::ThroughFlaggedPool(flagged_route));
                 }
                 continue;
             };
@@ -498,10 +530,11 @@ impl<'a> PricingPassState<'a> {
                 }
                 ReverseSellOutcome::FlaggedPool(component_id, reason) => {
                     self.flag(component_id, reason);
-                    for_sell_solve.insert(token, flagged_route);
+                    for_sell_solve
+                        .insert(token, SellSolveBuyLeg::ThroughFlaggedPool(flagged_route));
                 }
                 ReverseSellOutcome::MissingHopData => {
-                    for_sell_solve.insert(token, buy_leg);
+                    for_sell_solve.insert(token, SellSolveBuyLeg::Trusted(buy_leg));
                 }
             }
         }
@@ -569,11 +602,7 @@ impl<'a> PricingPassState<'a> {
         // The legs are discarded after the mean; this is the only place their divergence —
         // sell_out under the probe amount is the round-trip loss — can be observed.
         trace!(%token, buy_out = %buy_leg.amount_out, sell_out = %sell_out, "token priced");
-        let path_components = buy_leg
-            .hops
-            .iter()
-            .map(|(_, _, component_id)| component_id.clone())
-            .collect();
+        let path_components = collect_route_components(buy_leg);
         let mid_price = Price {
             numerator: &buy_leg.amount_out * (&self.computation.probe_amount + &sell_out),
             denominator: BigUint::from(2u8) * &self.computation.probe_amount * sell_out,
@@ -587,18 +616,23 @@ impl<'a> PricingPassState<'a> {
     fn price_with_sell_solve(
         &mut self,
         token: &Address,
-        buy_leg: &ReachedToken,
+        buy_leg: &SellSolveBuyLeg,
     ) -> TokenPricingOutcome {
-        match self.solve_sell_leg(token, buy_leg.amount_out.clone()) {
-            Ok((sell_out, sell_components)) => {
-                let mut entry = self.build_price_entry(token, buy_leg, sell_out);
-                entry
-                    .path_components
-                    .extend(sell_components);
-                TokenPricingOutcome::Priced(entry)
-            }
-            Err(error) => TokenPricingOutcome::Failed(error),
-        }
+        let (SellSolveBuyLeg::Trusted(route) | SellSolveBuyLeg::ThroughFlaggedPool(route)) =
+            buy_leg;
+        let (sell_out, sell_components) = match self.solve_sell_leg(token, route.amount_out.clone())
+        {
+            Ok(sell_leg) => sell_leg,
+            Err(error) => return TokenPricingOutcome::Failed(error),
+        };
+        let mut entry = match buy_leg {
+            SellSolveBuyLeg::Trusted(route) => self.build_price_entry(token, route, sell_out),
+            SellSolveBuyLeg::ThroughFlaggedPool(route) => build_sell_rate_entry(route, sell_out),
+        };
+        entry
+            .path_components
+            .extend(sell_components);
+        TokenPricingOutcome::Priced(entry)
     }
 
     /// Sells the bought amount back along the buy route, hop by hop in reverse. Returns
