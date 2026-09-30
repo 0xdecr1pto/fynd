@@ -1,4 +1,25 @@
 
+## [0.110.4](https://github.com/propeller-heads/fynd/compare/0.110.3...0.110.4) (2026-09-30)
+
+### Features
+
+* **bench:** time later blocks apart and check derived values ([0a0bd7c](https://github.com/propeller-heads/fynd/commit/0a0bd7cef90d6e32ea90a8d109a8961a14c14092))
+
+### Bug Fixes
+
+* **token-prices:** refresh prices that no pass attempted for 100 passes ([8aa50dd](https://github.com/propeller-heads/fynd/commit/8aa50dd8e65cb2fe3c35c26986df989c25b98e49))
+* **token-prices:** drop the failures of attempted and removed tokens ([7e111b5](https://github.com/propeller-heads/fynd/commit/7e111b5cc6727a8193601dfe4d8e594c227adc8d))
+* **token-prices:** price a flagged buy route at the sell rate alone ([fedc488](https://github.com/propeller-heads/fynd/commit/fedc4887e7ba66c0988a665013b4ec1555809762))
+* **derived:** drop the failures of removed components ([7169d69](https://github.com/propeller-heads/fynd/commit/7169d697594637c5fac3d7e1347c161449529411))
+
+### Performance Improvements
+
+* **pool-depths:** measure depth as a 1.5% fall of the net price ([497259d](https://github.com/propeller-heads/fynd/commit/497259d999de03fb511935f6afcc0eb6b214aae0))
+* **token-prices:** cap sell solves at 200 per pass ([088ddfa](https://github.com/propeller-heads/fynd/commit/088ddfaa557f33ddfd8ca14e2cfd38bd6182e489))
+* **token-prices:** price 500 tokens per pass every second ([b3a469d](https://github.com/propeller-heads/fynd/commit/b3a469d47485e6faf9f0cd48d82f4dd7f3b8945e))
+* **token-prices:** sell each token back along its buy route ([2181dc5](https://github.com/propeller-heads/fynd/commit/2181dc51228402cc9ae49c81b6b8ce80216b5019))
+
+
 ## [0.110.3](https://github.com/propeller-heads/fynd/compare/0.110.2...0.110.3) (2026-09-28)
 
 ### Features
