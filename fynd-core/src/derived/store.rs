@@ -246,6 +246,12 @@ impl DerivedData {
             .map(|(block, error)| (*block, error))
     }
 
+    /// Keeps only the token price failures of the tokens for which `keep` returns true.
+    pub(crate) fn retain_token_price_failures(&mut self, keep: impl Fn(&Address) -> bool) {
+        self.token_prices_failed
+            .retain(|token, _| keep(token));
+    }
+
     /// Clears token prices and their failure map.
     pub fn clear_token_prices(&mut self) {
         self.clear_output(TokenGasPriceComputation::ID);

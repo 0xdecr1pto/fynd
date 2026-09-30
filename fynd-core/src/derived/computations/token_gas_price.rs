@@ -735,6 +735,14 @@ struct PricingPassOutcome {
     new_flagged_components: FxHashSet<ComponentId>,
 }
 
+/// Drops the stored failures of the tokens `solved` attempted, and of the tokens that left the
+/// market. Persisting the pass stores its new failures. An incremental update otherwise drops a
+/// failure only when its token gets a price, so the failure of a token that became unreachable or
+/// left the market would stay for the life of the process.
+fn drop_stale_failures(store: &mut DerivedData, solved: &PricingPassOutcome) {
+    store.retain_token_price_failures(|token| solved.unattempted.contains(token));
+}
+
 /// Computes token prices relative to the gas token from the routes that trade it.
 #[derive(Debug, Clone)]
 pub struct TokenGasPriceComputation {
@@ -1349,6 +1357,7 @@ impl TokenGasPriceComputation {
             .await?;
 
         let mut result = existing_prices;
+        drop_stale_failures(&mut *store.write().await, &solved);
         let edited = store
             .write()
             .await
@@ -1418,6 +1427,7 @@ impl TokenGasPriceComputation {
         let solved = self
             .solve_token_prices(market, None, &priority, PassScope::Whole, usize::MAX)
             .await?;
+        drop_stale_failures(&mut *store.write().await, &solved);
 
         let mut token_prices_with_deps = TokenPricesWithDeps::default();
         let mut token_prices = TokenGasPrices::default();
