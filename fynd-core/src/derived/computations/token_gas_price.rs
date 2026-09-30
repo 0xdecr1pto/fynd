@@ -2973,6 +2973,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sell_rate_price_through_flagged_pool() {
+        // The skewed pool takes a 50% fee each way and is the only route to Y. One probe of
+        // 1 ETH buys 0.25 Y, and the sell solve sells that back for 0.25 ETH. The sell rate is
+        // 1 Y per ETH on both pricing passes; the mean of the two rates would be 0.625.
+        let eth = token(0, "ETH");
+        let y = token(1, "Y");
+        let skewed_pool = MockProtocolSim::new(0.5)
+            .with_reverse_spot_factor(0.5)
+            .with_fee(0.5);
+        let (market, _) = setup_market_weighted(vec![("skewed", &eth, &y, skewed_pool)]);
+        let store = DerivedData::new_shared();
+        let computation = computation_for(&eth.address);
+        let skewed_changed =
+            ChangedComponents { updated: vec!["skewed".to_string()], ..Default::default() };
+
+        let first = computation
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail")
+            .data;
+        let second = computation
+            .compute(&market, &store, &skewed_changed)
+            .await
+            .expect("pricing must not fail")
+            .data;
+
+        assert!((ratio(&first[&y.address]) - 1.0).abs() < 1e-9);
+        assert!((ratio(&second[&y.address]) - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
     async fn test_unreachable_token() {
         let eth = token(0, "ETH");
         let usdc = token(1, "USDC");
