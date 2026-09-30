@@ -53,7 +53,8 @@
 //!
 //! A price's `path_components` hold its buy route's pools and, for a sell solve, its sell route's
 //! pools. A change to these dependencies makes the token eligible for a new price. A rival pool
-//! is not a dependency, so an improved rival route needs another change to make the token eligible.
+//! is not a dependency, so an improved rival route changes the price only after another change or
+//! after the price is stale.
 //!
 //! An attempted token that cannot be priced loses its old price and dependencies. Tokens with
 //! no buy route count as unreachable; tokens with no sell route produce failed items.
@@ -79,14 +80,16 @@
 //! # Selecting tokens
 //!
 //! The gas token needs no selection. A market token is eligible if it has no price, a dependency
-//! changed, or it is an arrival: a token of an added component. Arrivals come first because no
-//! stored dependency names a new component, and quotes need token prices. Arrivals keep this
-//! priority until attempted. Other priced tokens need a dependency change to become eligible.
+//! changed, its price is stale, or it is an arrival: a token of an added component. Arrivals come
+//! first because no stored dependency names a new component, and quotes need token prices.
+//! Arrivals keep this priority until attempted. A price is stale when no pass attempted its token
+//! in the last `MAX_PRICE_AGE_PASSES` pricing passes.
 //!
 //! Each token's stamp records the last pricing pass that attempted it, including failures.
 //! Never-attempted tokens have stamp zero. Within each priority group, the smallest stamp comes
 //! first, so failures move behind older eligible tokens. A priced token left out by the cap needs
-//! another dependency change to become eligible again unless it keeps arrival priority.
+//! another dependency change or a stale price to become eligible again, unless it keeps arrival
+//! priority.
 //!
 //! `max_tokens_per_pass` caps selection in every pricing pass except seeding, including passes
 //! for arrivals only. Selection precedes snapshot creation so the snapshot covers routes toward
@@ -835,6 +838,8 @@ pub(crate) struct PassPriority {
     /// The pass each token was last attempted in, from `PassHistory`. Absent means never
     /// attempted, which ranks the token ahead of every attempted one.
     last_attempted: FxHashMap<Address, u64>,
+    /// The number of the last pass that ran, from `PassHistory`.
+    passes: u64,
 }
 
 impl PassPriority {
@@ -852,6 +857,13 @@ impl PassPriority {
             .copied()
             .unwrap_or(0)
     }
+
+    /// Whether the last pass that attempted `token` is `MAX_PRICE_AGE_PASSES` or more passes old.
+    fn is_stale(&self, token: &Address) -> bool {
+        self.passes
+            .saturating_sub(self.stamp(token)) >=
+            MAX_PRICE_AGE_PASSES
+    }
 }
 
 /// Chooses and orders the tokens one pass attempts, and caps how many it takes.
@@ -861,12 +873,13 @@ impl PassPriority {
 /// set has to be known before any solving starts. The budget stays a backstop for a pathological
 /// token, not the thing that decides the size of a pass.
 ///
-/// A token is a candidate when a change points at it, when a component carrying it arrived, or
-/// when it has no price. That last case is the one a selection built from stored dependencies
-/// cannot express: an unpriced token is in no dependency set, so nothing would ever point at it
-/// and it would stay unpriced for as long as the process ran.
+/// A token is a candidate when a change points at it, when a component carrying it arrived, when
+/// its price is stale, or when it has no price. That last case is the one a selection built from
+/// stored dependencies cannot express: an unpriced token is in no dependency set, so nothing would
+/// ever point at it and it would stay unpriced for as long as the process ran.
 ///
-/// Rank, in order: arrived, then the tokens a change points at and the ones with no price.
+/// Rank, in order: arrived, then the tokens a change points at, the stale ones, and the ones with
+/// no price.
 /// Within a rank the token whose last attempt is oldest comes first, so a cap smaller than the
 /// candidates rotates over them instead of starving the tail, and a token that no pass has
 /// attempted yet comes before every token that has a price.
@@ -904,8 +917,11 @@ fn select_pass_tokens(
         if scope == PassScope::ArrivalsOnly {
             continue;
         }
-        // A priced token is offered only when a change points at it; an unpriced one always is.
-        if !priority.priced.contains(token) || changed.is_none_or(|changed| changed.contains(token))
+        // A priced token is offered only when a change points at it or its price is stale; an
+        // unpriced one always is.
+        if !priority.priced.contains(token) ||
+            changed.is_none_or(|changed| changed.contains(token)) ||
+            priority.is_stale(token)
         {
             ranked.push((ROTATING, stamp, token.clone()));
         }
@@ -924,6 +940,11 @@ fn select_pass_tokens(
 /// Passes for the tokens of added components run inside `min_pass_interval` and count too, so a
 /// flag can expire sooner than `FLAGGED_POOL_PASSES` intervals.
 const FLAGGED_POOL_PASSES: u64 = 100;
+
+/// How many pricing passes a priced token waits before a pass offers it with no change on its
+/// route. A token's dependencies leave out rival pools, so an improved rival route changes the
+/// price only through this refresh. Passes for the tokens of added components count too.
+const MAX_PRICE_AGE_PASSES: u64 = 100;
 
 /// Default wall-clock budget for a pricing pass after its first buy pass.
 ///
@@ -1052,6 +1073,7 @@ impl TokenGasPriceComputation {
             arrived: state.pending_arrivals.clone(),
             priced,
             last_attempted: state.last_attempted.clone(),
+            passes: state.passes,
         }
     }
 
@@ -2046,6 +2068,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            passes: 9,
         };
         let changed: FxHashSet<Address> = [changed_token.clone()]
             .into_iter()
@@ -2082,6 +2105,7 @@ mod tests {
             last_attempted: [(with_price.clone(), 7)]
                 .into_iter()
                 .collect(),
+            passes: 0,
         };
 
         let ordered =
@@ -2111,6 +2135,7 @@ mod tests {
             last_attempted: [(stale.clone(), 1), (fresh.clone(), 8)]
                 .into_iter()
                 .collect(),
+            passes: 0,
         };
 
         let ordered = select_pass_tokens(&universe, None, &priority, PassScope::Whole, 2);
