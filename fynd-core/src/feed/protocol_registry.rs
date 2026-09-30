@@ -8,7 +8,7 @@ use tycho_simulation::{
         protocol::{
             aerodrome_slipstreams::state::AerodromeSlipstreamsState,
             aerodrome_v1::state::AerodromeV1State,
-            balancer_v3::state::BalancerV3State,
+            balancer_v3::BalancerV3State,
             curve::CurveState,
             ekubo::state::EkuboState,
             ekubo_v3::state::EkuboV3State,
