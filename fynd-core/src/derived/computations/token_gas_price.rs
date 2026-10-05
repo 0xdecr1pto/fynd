@@ -2979,6 +2979,13 @@ mod tests {
                 .contains_key(&oneway.address),
             "a dropped token must leave the dependency map too"
         );
+        assert!(
+            !computation
+                .lock_pass_history()
+                .routes
+                .contains_key(&oneway.address),
+            "a dropped token must leave the stored routes too"
+        );
     }
 
     #[tokio::test]
@@ -3006,6 +3013,66 @@ mod tests {
             .expect("deps are stored")[&usdc.address]
             .path_components;
         assert_eq!(deps, &FxHashSet::from_iter(["direct".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_route_and_amounts() {
+        // USDC is reachable only through ETH->MID->USDC. Fee-free pools buy 1500 USDC with one
+        // ETH probe and sell it back for the whole probe. A mock pool quotes its rate in address
+        // order, so MID takes the lower address.
+        let eth = token(0, "ETH");
+        let mid = token(1, "MID");
+        let usdc = token(2, "USDC");
+        let (market, _) = setup_market_weighted(vec![
+            ("eth_mid", &eth, &mid, MockProtocolSim::new(1.0)),
+            ("mid_usdc", &mid, &usdc, MockProtocolSim::new(1500.0)),
+        ]);
+        let store = DerivedData::new_shared();
+        let computation = computation_for(&eth.address);
+        computation
+            .compute(&market, &store, &ChangedComponents::default())
+            .await
+            .expect("pricing must not fail");
+
+        let history = computation.lock_pass_history();
+        let route = &history.routes[&usdc.address];
+        assert_eq!(route.components, vec!["eth_mid".to_string(), "mid_usdc".to_string()]);
+        let buy_amount_out = route
+            .buy_amount_out
+            .to_f64()
+            .expect("amount fits in f64");
+        let sell_amount_out = route
+            .sell_amount_out
+            .to_f64()
+            .expect("amount fits in f64");
+        assert!((buy_amount_out / PROBE_AMOUNT as f64 - 1500.0).abs() < 1e-6);
+        assert!((sell_amount_out / PROBE_AMOUNT as f64 - 1.0).abs() < 1e-6);
+    }
+
+    #[rstest::rstest]
+    #[case::up_ten_percent(100, 110, Some(1.1))]
+    #[case::down_ten_percent(110, 100, Some(100.0 / 110.0))]
+    #[case::up_five_percent(100, 105, None)]
+    #[case::unchanged(100, 100, None)]
+    #[case::stored_zero(0, 100, None)]
+    #[case::new_zero(100, 0, None)]
+    fn test_price_jump_ratio(
+        #[case] stored_numerator: u64,
+        #[case] new_numerator: u64,
+        #[case] expected: Option<f64>,
+    ) {
+        let price = |numerator: u64| Price {
+            numerator: BigUint::from(numerator),
+            denominator: BigUint::from(100u64),
+        };
+
+        let jump = price_jump_ratio(&price(stored_numerator), &price(new_numerator));
+
+        match (jump, expected) {
+            (Some(jump), Some(expected)) => assert!((jump - expected).abs() < 1e-9),
+            (None, None) => {}
+            (jump, expected) => panic!("expected {expected:?}, got {jump:?}"),
+        }
     }
 
     /// A pool that fails the reverse sell check: one whose output cap stops the reverse sell, or
@@ -3141,6 +3208,11 @@ mod tests {
             .expect("deps are stored")[&y.address]
             .path_components;
         assert_eq!(deps, &FxHashSet::from_iter(["skewed".to_string()]));
+        let history = computation.lock_pass_history();
+        assert_eq!(
+            history.routes[&y.address].components,
+            vec!["skewed".to_string(), "skewed".to_string()]
+        );
     }
 
     #[tokio::test]
